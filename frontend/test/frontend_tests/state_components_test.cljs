@@ -302,7 +302,7 @@
                    ; Renamed component
                    ;   Rect 1
                    (let [libs      (wsh/get-libraries new-state)
-                         component (cph/get-component libs
+                         component (ctf/get-component libs
                                                       (:component-file instance1)
                                                       (:component-id instance1))]
                      (t/is (= (:name component)
@@ -367,7 +367,7 @@
 
      (ptk/emit!
        store
-       (dwl/duplicate-component {:id component-id})
+       (dwl/duplicate-component thp/current-file-id component-id)
        :the/end))))
 
 (t/deftest test-delete-component
@@ -400,7 +400,7 @@
                            (:id instance1))
 
                          libs      (wsh/get-libraries new-state)
-                         component (cph/get-component libs
+                         component (ctf/get-component libs
                                                       (:component-file instance1)
                                                       (:component-id instance1))]
 

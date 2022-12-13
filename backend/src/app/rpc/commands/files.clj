@@ -552,7 +552,9 @@
        (map (fn [{:keys [id] :as row}]
               (binding [pmap/*load-fn* (partial load-pointer conn id)]
                 (-> row
-                    (update :data dissoc :pages-index)
+                    ;; TODO: re-enable this dissoc and replace call
+                    ;;       with other that gets files individually
+                    ;; (update :data dissoc :pages-index)
                     (handle-file-features client-features)))))
        (vec)))
 
