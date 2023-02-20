@@ -275,10 +275,10 @@
   (as-> f $
     (wrap-dispatch cfg $ mdata)
     (wrap-metrics cfg $ mdata)
-    (cond/wrap cfg $ mdata)
+    ;; (cond/wrap cfg $ mdata)
     (retry/wrap-retry cfg $ mdata)
-    (climit/wrap cfg $ mdata)
-    (rlimit/wrap cfg $ mdata)
+    ;; (climit/wrap cfg $ mdata)
+    ;; (rlimit/wrap cfg $ mdata)
     (wrap-audit cfg $ mdata)
     (wrap-spec-conform cfg $ mdata)
     (wrap-authentication cfg $ mdata)
