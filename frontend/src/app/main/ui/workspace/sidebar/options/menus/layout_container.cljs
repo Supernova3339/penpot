@@ -329,7 +329,7 @@
      :alt    "Grid edit mode"
      :on-click #(toggle-edit-mode)
      :style {:padding 0}}
-    i/set-thumbnail]])
+    i/grid-layout-mode]])
 
 (mf/defc align-grid-row
   [{:keys [is-col? align-items set-align] :as props}]
