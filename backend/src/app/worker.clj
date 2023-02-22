@@ -43,13 +43,19 @@
   (s/keys :req [::parallelism]))
 
 (defmethod ig/init-key ::executor
-  [skey {:keys [::parallelism]}]
+  [skey {:keys [::parallelism ::type] :or {type :fjoin}}]
   (let [prefix  (if (vector? skey) (-> skey first name) "default")
-        tname   (str "penpot/" prefix "/%s")
-        factory (px/forkjoin-thread-factory :name tname)]
-    (px/forkjoin-executor {:factory factory
-                           :parallelism parallelism
-                           :async true})))
+        tname   (str "penpot/" prefix "/%s")]
+    (case type
+      :fjoin
+      (let [factory (px/forkjoin-thread-factory :name tname)]
+        (px/forkjoin-executor {:factory factory
+                               :parallelism parallelism
+                               :async true}))
+
+      :cached
+      (let [factory (px/thread-factory :name tname)]
+        (px/cached-executor :factory factory)))))
 
 (defmethod ig/halt-key! ::executor
   [_ instance]

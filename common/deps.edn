@@ -25,8 +25,10 @@
 
   funcool/cuerdas {:mvn/version "2022.06.16-403"}
   funcool/promesa
-  {:git/tag "11.0-alpha8"
-   :git/sha "6bec3b7"
+  {
+   ;; :git/tag "11.0-alpha8"
+   ;; :git/sha "6bec3b7"
+   :git/sha "0aa8017c04eb54a41cc2766e1c8770f14142655e"
    :git/url "https://github.com/funcool/promesa.git"}
 
   lambdaisland/uri {:mvn/version "1.13.95"

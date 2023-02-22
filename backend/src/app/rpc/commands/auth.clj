@@ -18,7 +18,7 @@
    [app.loggers.audit :as audit]
    [app.main :as-alias main]
    [app.rpc :as-alias rpc]
-   [app.rpc.climit :as climit]
+   [app.rpc.climit :as-alias climit]
    [app.rpc.commands.profile :as profile]
    [app.rpc.commands.teams :as teams]
    [app.rpc.doc :as-alias doc]

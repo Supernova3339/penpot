@@ -61,6 +61,10 @@
   (let [headers (-> err ex-data ::http/headers)]
     (yrs/response :status 429 :body "" :headers headers)))
 
+(defmethod handle-exception :concurrency-limit
+  [err _]
+  (yrs/response :status 429 :body ""))
+
 (defmethod handle-exception :validation
   [err _]
   (let [{:keys [code] :as data} (ex-data err)]
@@ -98,17 +102,12 @@
 (defmethod handle-exception :internal
   [error request]
   (let [{:keys [code] :as edata} (ex-data error)]
-    (cond
-      (= :concurrency-limit-reached code)
-      (yrs/response 429)
-
-      :else
-      (binding [l/*context* (request->context request)]
-        (l/error :hint "Internal error" :message (ex-message error) :cause error)
-        (yrs/response 500 {:type :server-error
-                           :code :unhandled
-                           :hint (ex-message error)
-                           :data edata})))))
+    (binding [l/*context* (request->context request)]
+      (l/error :hint "Internal error" :message (ex-message error) :cause error)
+      (yrs/response 500 {:type :server-error
+                         :code :unhandloed
+                         :hint (ex-message error)
+                         :data edata}))))
 
 (defmethod handle-exception org.postgresql.util.PSQLException
   [error request]

@@ -8,6 +8,7 @@
   (:require
    [app.auth.oidc :as-alias oidc]
    [app.common.data :as d]
+   [promesa.exec :as px]
    [app.common.logging :as l]
    [app.common.transit :as t]
    [app.db :as-alias db]
@@ -71,13 +72,15 @@
                  :http/host host
                  :http/max-body-size (::max-body-size cfg)
                  :http/max-multipart-body-size (::max-multipart-body-size cfg)
-                 :xnio/io-threads (::io-threads cfg)
-                 :xnio/dispatch executor
+                 :xnio/io-threads (or (::io-threads cfg) (px/get-available-processors))
+                 :xnio/worker-threads (or (::worker-threads cfg)
+                                          (* (px/get-available-processors) 2))
+                 :xnio/dispatch true
                  :ring/async true}
 
         handler (cond
                   (some? router)
-                  (wrap-router router)
+                  (wrap-router executor router)
 
                   (some? handler)
                   handler
@@ -100,7 +103,7 @@
   (respond (yrs/response 404)))
 
 (defn- wrap-router
-  [router]
+  [^java.util.concurrent.Executor executor router]
   (letfn [(handler [request respond raise]
             (if-let [match (r/match-by-path router (yrq/path request))]
               (let [params  (:path-params match)
@@ -119,10 +122,14 @@
                      (assoc :body (t/encode-str body {:type :json-verbose})))))))]
 
     (fn [request respond _]
-      (try
-        (handler request respond #(on-error % request respond))
-        (catch Throwable cause
-          (on-error cause request respond))))))
+      (letfn [(respond' [response]
+                (yt/dispatch! request (partial respond response)))
+              (raise' [cause]
+                (yt/dispatch! request (partial on-error cause request respond')))]
+        (try
+          (handler request respond' raise')
+          (catch Throwable cause
+            (raise' cause)))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; HTTP ROUTER
@@ -131,6 +138,7 @@
 (defmethod ig/pre-init-spec ::router [_]
   (s/keys :req [::session/manager
                 ::actoken/manager
+                ::wrk/executor
                 ::ws/routes
                 ::rpc/routes
                 ::rpc.doc/routes
@@ -142,7 +150,7 @@
                 ::awsns/routes]))
 
 (defmethod ig/init-key ::router
-  [_ cfg]
+  [_ {:keys [::wrk/executor] :as cfg}]
   (rr/router
    [["" {:middleware [[mw/server-timing]
                       [mw/format-response]

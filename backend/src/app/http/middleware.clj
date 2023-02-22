@@ -14,6 +14,7 @@
    [cuerdas.core :as str]
    [promesa.core :as p]
    [promesa.exec :as px]
+   [promesa.util :as pu]
    [yetti.adapter :as yt]
    [yetti.middleware :as ymw]
    [yetti.request :as yrq]
@@ -94,12 +95,7 @@
   needed because transit-java calls flush very aggresivelly on each
   object write."
   [^java.io.OutputStream os ^long chunk-size]
-  (proxy [java.io.BufferedOutputStream] [os (int chunk-size)]
-    ;; Explicitly do not forward flush
-    (flush [])
-    (close []
-      (proxy-super flush)
-      (proxy-super close))))
+  (yetti.util.BufferedOutputStream. os (int chunk-size)))
 
 (def ^:const buffer-size (:xnio/buffer-size yt/defaults))
 
@@ -112,10 +108,7 @@
                   (with-open [bos (buffered-output-stream output-stream buffer-size)]
                     (let [tw (t/writer bos opts)]
                       (t/write! tw data)))
-
-                  (catch java.io.IOException _cause
-                    ;; Do nothing, EOF means client closes connection abruptly
-                    nil)
+                  (catch java.io.IOException _)
                   (catch Throwable cause
                     (l/warn :hint "unexpected error on encoding response"
                             :cause cause))
@@ -126,13 +119,10 @@
             (reify yrs/StreamableResponseBody
               (-write-body-to-stream [_ _ output-stream]
                 (try
-
                   (with-open [bos (buffered-output-stream output-stream buffer-size)]
                     (json/write! bos data json-mapper))
 
-                  (catch java.io.IOException _cause
-                    ;; Do nothing, EOF means client closes connection abruptly
-                    nil)
+                  (catch java.io.IOException _)
                   (catch Throwable cause
                     (l/warn :hint "unexpected error on encoding response"
                             :cause cause))
@@ -249,10 +239,9 @@
    (fn [& _]
      (fn [handler executor]
        (fn [request respond raise]
-         (-> (px/submit! executor #(handler request))
-             (p/bind p/wrap)
-             (p/then respond)
-             (p/catch raise)))))})
+         (->> (px/submit! executor #(handler request))
+              (p/mcat p/wrap)
+              (p/fnly (pu/handler respond raise))))))})
 
 (def with-config
   {:name ::with-config

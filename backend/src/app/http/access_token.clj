@@ -54,7 +54,7 @@
   (let [{:keys [::wrk/executor ::main/props]} manager]
     (fn [request respond raise]
       (let [token (get-token request)]
-        (->> (px/submit! executor (partial decode-token props token))
+        (->> (px/submit! :vthread (partial decode-token props token))
              (p/fnly (fn [claims cause]
                        (when cause
                          (l/trace :hint "exception on decoding malformed token" :cause cause))
@@ -69,7 +69,7 @@
   (let [{:keys [::wrk/executor ::db/pool]} manager]
     (fn [request respond raise]
       (if-let [token-id (::id request)]
-        (->> (px/submit! executor (partial get-token-perms pool token-id))
+        (->> (px/submit! :vthread (partial get-token-perms pool token-id))
              (p/fnly (fn [perms cause]
                        (cond
                          (some? cause)

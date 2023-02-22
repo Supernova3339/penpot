@@ -23,12 +23,15 @@
    [integrant.core :as ig]
    [promesa.core :as p]
    [promesa.exec :as px]
-   [promesa.exec.bulkhead :as pxb])
+   [promesa.exec.bulkhead :as pbh])
   (:import
-   com.github.benmanes.caffeine.cache.Cache
+   clojure.lang.ExceptionInfo
+   com.github.benmanes.caffeine.cache.LoadingCache
    com.github.benmanes.caffeine.cache.CacheLoader
    com.github.benmanes.caffeine.cache.Caffeine
    com.github.benmanes.caffeine.cache.RemovalListener))
+
+(set! *warn-on-reflection* true)
 
 (defn- capacity-exception?
   [o]
@@ -37,70 +40,6 @@
          (and (= :bulkhead-error (:type data))
               (= :capacity-limit-reached (:code data))))))
 
-(defn invoke!
-  [limiter f]
-  (->> (px/submit! limiter f)
-       (p/hcat (fn [result cause]
-                 (cond
-                   (capacity-exception? cause)
-                   (p/rejected
-                    (ex/error :type :internal
-                              :code :concurrency-limit-reached
-                              :queue (-> limiter meta ::bkey name)
-                              :cause cause))
-
-                   (some? cause)
-                   (p/rejected cause)
-
-                   :else
-                   (p/resolved result))))))
-
-(defn- create-limiter
-  [{:keys [::wrk/executor ::mtx/metrics ::bkey ::skey concurrency queue-size]}]
-  (let [labels   (into-array String [(name bkey)])
-        on-queue (fn [instance]
-                   (l/trace :hint "enqueued"
-                            :key (name bkey)
-                            :skey (str skey)
-                            :queue-size (get instance ::pxb/current-queue-size)
-                            :concurrency (get instance ::pxb/current-concurrency))
-                   (mtx/run! metrics
-                             :id :rpc-climit-queue-size
-                             :val (get instance ::pxb/current-queue-size)
-                             :labels labels)
-                   (mtx/run! metrics
-                             :id :rpc-climit-concurrency
-                             :val (get instance ::pxb/current-concurrency)
-                             :labels labels))
-
-        on-run   (fn [instance task]
-                   (let [elapsed (- (inst-ms (dt/now))
-                                    (inst-ms task))]
-                     (l/trace :hint "execute"
-                              :key (name bkey)
-                              :skey (str skey)
-                              :elapsed (str elapsed "ms"))
-                     (mtx/run! metrics
-                               :id :rpc-climit-timing
-                               :val elapsed
-                               :labels labels)
-                     (mtx/run! metrics
-                               :id :rpc-climit-queue-size
-                               :val (get instance ::pxb/current-queue-size)
-                               :labels labels)
-                     (mtx/run! metrics
-                               :id :rpc-climit-concurrency
-                               :val (get instance ::pxb/current-concurrency)
-                               :labels labels)))
-
-        options  {:executor executor
-                  :concurrency concurrency
-                  :queue-size (or queue-size Integer/MAX_VALUE)
-                  :on-queue on-queue
-                  :on-run on-run}]
-
-    (-> (pxb/create options)
-        (vary-meta assoc ::bkey bkey ::skey skey))))
 
 (defn- create-cache
   [{:keys [::wrk/executor] :as params} config]
@@ -111,96 +50,155 @@
         loader   (reify CacheLoader
                    (load [_ key]
                      (let [[bkey skey] key]
-                       (when-let [config (get config bkey)]
-                         (-> (merge params config)
-                             (assoc ::bkey bkey)
-                             (assoc ::skey skey)
-                             (create-limiter))))))]
+                       (let [config (get config bkey)]
+                         (pbh/create :permits (or (:permits config) (:concurrency config))
+                                     :queue (or (:queue config) (:queue-size config))
+                                     :timeout (:timeout config)
+                                     :executor executor
+                                     :type (:type config :semaphore))))))]
+    (.. (Caffeine/newBuilder)
+        (weakValues)
+        (executor executor)
+        (removalListener listener)
+        (build loader))))
 
-  (.. (Caffeine/newBuilder)
-      (weakValues)
-      (executor executor)
-      (removalListener listener)
-      (build loader))))
-
-(defprotocol IConcurrencyManager)
-
-(s/def ::concurrency ::us/integer)
-(s/def ::queue-size ::us/integer)
+(s/def ::permits ::us/integer)
+(s/def ::queue ::us/integer)
+(s/def ::timeout ::us/integer)
 (s/def ::config
   (s/map-of keyword?
-            (s/keys :req-un [::concurrency]
-                    :opt-un [::queue-size])))
+            (s/keys :opt-un [::permits ::queue ::timeout])))
 
 (defmethod ig/prep-key ::rpc/climit
   [_ cfg]
-  (merge {::path (cf/get :rpc-climit-config)}
-         (d/without-nils cfg)))
+  (assoc cfg ::path (cf/get :rpc-climit-config)))
 
 (s/def ::path ::fs/path)
-
 (defmethod ig/pre-init-spec ::rpc/climit [_]
   (s/keys :req [::wrk/executor ::mtx/metrics ::path]))
 
 (defmethod ig/init-key ::rpc/climit
-  [_ {:keys [::path] :as params}]
+  [_ {:keys [::path ::mtx/metrics] :as cfg}]
   (when (contains? cf/flags :rpc-climit)
-    (if-let [config (some->> path slurp edn/read-string)]
+    (if-let [params (some->> path slurp edn/read-string)]
       (do
         (l/info :hint "initializing concurrency limit" :config (str path))
-        (us/verify! ::config config)
-
-        (let [cache (create-cache params config)]
-          ^{::cache cache}
-          (reify
-            IConcurrencyManager
-            clojure.lang.IDeref
-            (deref [_] config)
-
-            clojure.lang.ILookup
-            (valAt [_ key]
-              (let [key (if (vector? key) key [key])]
-                (.get ^Cache cache key))))))
+        (us/verify! ::config params)
+        {::cache (create-cache cfg params)
+         ::config params
+         ::mtx/metrics metrics})
 
       (l/warn :hint "unable to load configuration" :config (str path)))))
 
-
+(s/def ::cache #(instance? LoadingCache %))
 (s/def ::rpc/climit
-  (s/nilable #(satisfies? IConcurrencyManager %)))
+  (s/nilable
+   (s/keys :req [::cache ::config])))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; PUBLIC API
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
+(defn invoke!
+  [cache metrics queue key f]
+  (let [limiter (.get ^LoadingCache cache [queue key])
+        tpoint  (dt/tpoint)
+        labels  (into-array String [(name queue)])
+
+        wrapped
+        (fn []
+          (let [elapsed (tpoint)
+                stats   (pbh/get-stats limiter)]
+            (l/trace :hint "executed"
+                     :name queue
+                     :key key
+                     :fnh (hash f)
+                     :permits (:permits stats)
+                     :queue (:queue stats)
+                     :max-permits (:max-permits stats)
+                     :max-queue (:max-queue stats)
+                     :elapsed (dt/format-duration elapsed))
+            (mtx/run! metrics
+                      :id :rpc-climit-timing
+                      :val (inst-ms elapsed)
+                      :labels labels)
+            (f)))
+
+        measure!
+        (fn [stats]
+          (mtx/run! metrics
+                    :id :rpc-climit-queue
+                    :val (:queue stats)
+                    :labels labels)
+          (mtx/run! metrics
+                    :id :rpc-climit-permits
+                    :val (:permits stats)
+                    :labels labels))]
+
+    (try
+      (let [stats (pbh/get-stats limiter)]
+        (measure! stats)
+        (l/trace :hint "enqueued"
+                 :name queue
+                 :key key
+                 :fnh (hash f)
+                 :permits (:permits stats)
+                 :queue (:queue stats)
+                 :max-permits (:max-permits stats)
+                 :max-queue (:max-queue stats))
+        (pbh/invoke! limiter wrapped))
+      (catch ExceptionInfo cause
+        (let [{:keys [type code]} (ex-data cause)]
+          (if (= :bulkhead-error type)
+            (ex/raise :type :concurrency-limit
+                      :code code
+                      :hint "concurrency limit reached")
+            (throw cause))))
+
+      (finally
+        (measure! (pbh/get-stats limiter))))))
+
+(defmacro with-dispatch!
+  "Dispatch blocking operation to a separated thread protected with
+  the specified semaphore."
+  [opts & body]
+  (let [f-sym    (gensym "f")
+        executor (::executor opts)
+        queue    (::queue opts)
+        instance (::instance opts)]
+    `(let [cache#   (get ~instance :app.rpc.climit/cache)
+           metrics# (get ~instance :app.metrics/metrics)
+           ~f-sym   (fn [] ~@body)]
+       (invoke! cache# metrics# ~queue nil
+                ~(if executor
+                   `(fn [] (p/await! (px/submit! ~executor ~f-sym)))
+                   f-sym)))))
+
 (defmacro with-dispatch
-  [lim & body]
-  `(if ~lim
-     (invoke! ~lim (^:once fn [] (p/wrap (do ~@body))))
-     (p/wrap (do ~@body))))
+  "Dispatch blocking operation to a separated thread protected with
+  the specified semaphore."
+  [& params]
+  `(with-dispatch! ~@params))
+
+(def noop-fn (constantly nil))
 
 (defn wrap
-  [{:keys [::rpc/climit]} f {:keys [::queue ::key-fn] :as mdata}]
-  (if (and (some? climit)
-           (some? queue))
-    (if-let [config (get @climit queue)]
-      (do
+  [{:keys [::rpc/climit ::mtx/metrics]} f {:keys [::queue ::key-fn] :or {key-fn noop-fn} :as mdata}]
+  (if (and (some? climit) (some? queue))
+    (if-let [config (get-in climit [::config queue])]
+      (let [cache (::cache climit)]
         (l/debug :hint "wrap: instrumenting method"
                  :limit-name (name queue)
                  :service-name (::sv/name mdata)
-                 :queue-size (or (:queue-size config) Integer/MAX_VALUE)
-                 :concurrency (:concurrency config)
+                 :timeout (:timeout config)
+                 :permits (:permits config)
+                 :queue (:queue config)
                  :keyed? (some? key-fn))
-        (if (some? key-fn)
-          (fn [cfg params]
-            (let [key [queue (key-fn params)]
-                  lim (get climit key)]
-              (invoke! lim (partial f cfg params))))
-          (let [lim (get climit queue)]
-            (fn [cfg params]
-              (invoke! lim (partial f cfg params))))))
+        (fn [cfg params]
+          (invoke! cache metrics queue (key-fn params) (partial f cfg params))))
+
       (do
-        (l/warn :hint "wrap: no config found"
-                :queue (name queue)
-                :service (::sv/name mdata))
+        (l/warn :hint "no config found for specified queue" :queue queue)
         f))
+
     f))

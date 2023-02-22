@@ -82,27 +82,23 @@
     ::main/props props}
   (reify ISessionManager
     (read [_ token]
-      (px/with-dispatch executor
-        (db/exec-one! pool (sql/select :http-session {:id token}))))
+      (db/exec-one! pool (sql/select :http-session {:id token})))
 
     (write! [_ key params]
-      (px/with-dispatch executor
-        (let [params (prepare-session-params key params)]
-          (db/insert! pool :http-session params)
-          params)))
+      (let [params (prepare-session-params key params)]
+        (db/insert! pool :http-session params)
+        params))
 
     (update! [_ params]
       (let [updated-at (dt/now)]
-        (px/with-dispatch executor
-          (db/update! pool :http-session
-                      {:updated-at updated-at}
-                      {:id (:id params)})
-          (assoc params :updated-at updated-at))))
+        (db/update! pool :http-session
+                    {:updated-at updated-at}
+                    {:id (:id params)})
+        (assoc params :updated-at updated-at)))
 
     (delete! [_ token]
-      (px/with-dispatch executor
-        (db/delete! pool :http-session {:id token})
-        nil))))
+      (db/delete! pool :http-session {:id token})
+      nil)))
 
 (defn inmemory-manager
   [{:keys [::db/pool ::wrk/executor ::main/props]}]
@@ -112,24 +108,21 @@
       ::db/pool pool}
     (reify ISessionManager
       (read [_ token]
-        (p/do (get @cache token)))
+        (get @cache token))
 
       (write! [_ key params]
-        (p/do
-          (let [params (prepare-session-params key params)]
-            (swap! cache assoc key params)
-            params)))
+        (let [params (prepare-session-params key params)]
+          (swap! cache assoc key params)
+          params))
 
       (update! [_ params]
-        (p/do
-          (let [updated-at (dt/now)]
-            (swap! cache update (:id params) assoc :updated-at updated-at)
-            (assoc params :updated-at updated-at))))
+        (let [updated-at (dt/now)]
+          (swap! cache update (:id params) assoc :updated-at updated-at)
+          (assoc params :updated-at updated-at)))
 
       (delete! [_ token]
-        (p/do
-          (swap! cache dissoc token)
-          nil)))))
+        (swap! cache dissoc token)
+        nil))))
 
 (defmethod ig/pre-init-spec ::manager [_]
   (s/keys :req [::db/pool ::wrk/executor ::main/props]))
@@ -219,7 +212,7 @@
 (defn- wrap-reneval
   [respond manager session]
   (fn [response]
-    (p/let [session (update! manager session)]
+    (let [session (update! manager session)]
       (-> response
           (assign-auth-token-cookie session)
           (assign-authenticated-cookie session)
@@ -228,45 +221,31 @@
 (defn- wrap-soft-auth
   [handler {:keys [::manager]}]
   (us/assert! ::manager manager)
-
   (let [{:keys [::wrk/executor ::main/props]} (meta manager)]
     (fn [request respond raise]
       (let [token (ex/try! (get-token request))]
         (if (ex/exception? token)
           (raise token)
-          (->> (px/submit! executor (partial decode-token props token))
-               (p/fnly (fn [claims cause]
-                         (when cause
-                           (l/trace :hint "exception on decoding malformed token" :cause cause))
-                         (let [request (cond-> request
-                                         (map? claims)
-                                         (-> (assoc ::token-claims claims)
-                                             (assoc ::token token)))]
-                           (handler request respond raise))))))))))
+          (let [claims  (decode-token props token)
+                request (cond-> request
+                          (map? claims)
+                          (-> (assoc ::token-claims claims)
+                              (assoc ::token token)))]
+            (handler request respond raise)))))))
 
 (defn- wrap-authz
   [handler {:keys [::manager]}]
   (us/assert! ::manager manager)
   (fn [request respond raise]
     (if-let [token (::token request)]
-      (->> (get-session manager token)
-           (p/fnly (fn [session cause]
-                     (cond
-                       (some? cause)
-                       (raise cause)
-
-                       (nil? session)
-                       (handler request respond raise)
-
-                       :else
-                       (let [request (-> request
-                                         (assoc ::profile-id (:profile-id session))
-                                         (assoc ::id (:id session)))
-                             respond (cond-> respond
-                                       (renew-session? session)
-                                       (wrap-reneval manager session))]
-                         (handler request respond raise))))))
-
+      (let [session (get-session manager token)
+            request (-> request
+                        (assoc ::profile-id (:profile-id session))
+                        (assoc ::id (:id session)))
+            respond (cond-> respond
+                      (renew-session? session)
+                      (wrap-reneval manager session))]
+        (handler request respond raise))
       (handler request respond raise))))
 
 (def soft-auth

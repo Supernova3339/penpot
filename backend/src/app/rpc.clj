@@ -36,6 +36,7 @@
    [integrant.core :as ig]
    [promesa.core :as p]
    [promesa.exec :as px]
+   [promesa.util :as pu]
    [yetti.request :as yrq]
    [yetti.response :as yrs]))
 
@@ -47,12 +48,10 @@
 
 (defn- handle-response-transformation
   [response request mdata]
-  (let [transform-fn (reduce (fn [res-fn transform-fn]
-                               (fn [request response]
-                                 (p/then (res-fn request response) #(transform-fn request %))))
-                             (constantly response)
-                             (::response-transform-fns mdata))]
-    (transform-fn request response)))
+  (reduce (fn [response transform-fn]
+            (transform-fn request response))
+          response
+          (::response-transform-fns mdata)))
 
 (defn- handle-before-comple-hook
   [response mdata]
@@ -63,13 +62,13 @@
 (defn- handle-response
   [request result]
   (if (fn? result)
-    (p/wrap (result request))
+    (result request)
     (let [mdata (meta result)]
-      (p/-> (yrs/response {:status  (::http/status mdata 200)
-                           :headers (::http/headers mdata {})
-                           :body    (rph/unwrap result)})
-            (handle-response-transformation request mdata)
-            (handle-before-comple-hook mdata)))))
+      (-> (yrs/response {:status  (::http/status mdata 200)
+                         :headers (::http/headers mdata {})
+                         :body    (rph/unwrap result)})
+          #_(handle-response-transformation request mdata)
+          #_(handle-before-comple-hook mdata)))))
 
 (defn- rpc-query-handler
   "Ring handler that dispatches query requests and convert between
@@ -91,10 +90,7 @@
 
     (->> (method data)
          (p/mcat (partial handle-response request))
-         (p/fnly (fn [response cause]
-                   (if cause
-                     (raise cause)
-                     (respond response)))))))
+         (p/fnly (pu/handler respond raise)))))
 
 (defn- rpc-mutation-handler
   "Ring handler that dispatches mutation requests and convert between
@@ -114,11 +110,8 @@
         method     (get methods type default-handler)]
 
     (->> (method data)
-         (p/mcat (partial handle-response request))
-         (p/fnly (fn [response cause]
-                   (if cause
-                     (raise cause)
-                     (respond response)))))))
+         (p/fmap (partial handle-response request))
+         (p/fnly (pu/handler respond raise)))))
 
 (defn- rpc-command-handler
   "Ring handler that dispatches cmd requests and convert between
@@ -141,11 +134,8 @@
 
     (binding [cond/*enabled* true]
       (->> (method data)
-           (p/mcat (partial handle-response request))
-           (p/fnly (fn [response cause]
-                     (if cause
-                       (raise cause)
-                       (respond response))))))))
+           (p/fmap (partial handle-response request))
+           (p/fnly (pu/handler respond raise))))))
 
 (defn- wrap-metrics
   "Wrap service method with metrics measurement."
@@ -153,12 +143,13 @@
   (let [labels (into-array String [(::sv/name mdata)])]
     (fn [cfg params]
       (let [tp (dt/tpoint)]
-        (->> (f cfg params)
-             (p/fnly (fn [_ _]
-                       (mtx/run! metrics
-                                 :id metrics-id
-                                 :val (inst-ms (tp))
-                                 :labels labels))))))))
+        (try
+          (f cfg params)
+          (finally
+            (mtx/run! metrics
+                      :id metrics-id
+                      :val (inst-ms (tp))
+                      :labels labels)))))))
 
 
 (defn- wrap-authentication
@@ -166,10 +157,9 @@
   (fn [cfg params]
     (let [profile-id (::profile-id params)]
       (if (and (::auth mdata true) (not (uuid? profile-id)))
-        (p/rejected
-         (ex/error :type :authentication
-                   :code :authentication-required
-                   :hint "authentication required for this endpoint"))
+        (ex/raise :type :authentication
+                  :code :authentication-required
+                  :hint "authentication required for this endpoint")
         (f cfg params)))))
 
 (defn- wrap-access-token
@@ -182,102 +172,85 @@
           (let [perms (::actoken/perms request #{})]
             (if (contains? perms name)
               (f cfg params)
-              (p/rejected
-               (ex/error :type :authorization
-                         :code :operation-not-allowed
-                         :allowed perms))))
+              (ex/raise :type :authorization
+                        :code :operation-not-allowed
+                        :allowed perms)))
           (f cfg params))))
     f))
 
-(defn- wrap-dispatch
-  "Wraps service method into async flow, with the ability to dispatching
-  it to a preconfigured executor service."
-  [{:keys [::wrk/executor] :as cfg} f mdata]
-  (with-meta
-    (fn [cfg params]
-      (->> (px/submit! executor (px/wrap-bindings #(f cfg params)))
-           (p/mapcat p/wrap)
-           (p/map rph/wrap)))
-    mdata))
+;; FIXME: cfg mdata? can the be the same?
+
+(defn- prepare-audit-event
+  [cfg mdata params result]
+  (let [resultm    (meta result)
+        request    (::http/request params)
+        profile-id (or (::audit/profile-id resultm)
+                       (:profile-id result)
+                       (::profile-id params)
+                       uuid/zero)
+
+        props      (-> (or (::audit/replace-props resultm)
+                           (-> params
+                               (merge (::audit/props resultm))
+                               (dissoc :profile-id)
+                               (dissoc :type)))
+
+                       (audit/clean-props))]
+    {:type (or (::audit/type resultm)
+               (::type cfg))
+     :name (or (::audit/name resultm)
+               (::sv/name mdata))
+     :profile-id profile-id
+     :ip-addr (some-> request audit/parse-client-ip)
+     :props props
+
+     ;; NOTE: for batch-key lookup we need the params as-is
+     ;; because the rpc api does not need to know the
+     ;; audit/webhook specific object layout.
+     ::params (dissoc params ::http/request)
+
+     ::webhooks/batch-key
+     (or (::webhooks/batch-key mdata)
+         (::webhooks/batch-key resultm))
+
+     ::webhooks/batch-timeout
+     (or (::webhooks/batch-timeout mdata)
+         (::webhooks/batch-timeout resultm))
+
+     ::webhooks/event?
+     (or (::webhooks/event? mdata)
+         (::webhooks/event? resultm)
+         false)}))
 
 (defn- wrap-audit
   [cfg f mdata]
   (if (or (contains? cf/flags :webhooks)
           (contains? cf/flags :audit-log))
-    (letfn [(handle-audit [params result]
-              (let [resultm    (meta result)
-                    request    (::http/request params)
-
-                    profile-id (or (::audit/profile-id resultm)
-                                   (:profile-id result)
-                                   (if (= (::type cfg) "command")
-                                     (::profile-id params)
-                                     (:profile-id params))
-                                   uuid/zero)
-
-                    props      (-> (or (::audit/replace-props resultm)
-                                       (-> params
-                                           (merge (::audit/props resultm))
-                                           (dissoc :profile-id)
-                                           (dissoc :type)))
-                                   (audit/clean-props))
-
-                    event      {:type (or (::audit/type resultm)
-                                          (::type cfg))
-                                :name (or (::audit/name resultm)
-                                          (::sv/name mdata))
-                                :profile-id profile-id
-                                :ip-addr (some-> request audit/parse-client-ip)
-                                :props props
-
-                                ;; NOTE: for batch-key lookup we need the params as-is
-                                ;; because the rpc api does not need to know the
-                                ;; audit/webhook specific object layout.
-                                ::params (dissoc params ::http/request)
-
-                                ::webhooks/batch-key
-                                (or (::webhooks/batch-key mdata)
-                                    (::webhooks/batch-key resultm))
-
-                                ::webhooks/batch-timeout
-                                (or (::webhooks/batch-timeout mdata)
-                                    (::webhooks/batch-timeout resultm))
-
-                                ::webhooks/event?
-                                (or (::webhooks/event? mdata)
-                                    (::webhooks/event? resultm)
-                                    false)}]
-
-                (audit/submit! cfg event)))
-
-            (handle-request [cfg params]
-              (->> (f cfg params)
-                   (p/fnly (fn [result cause]
-                             (when-not cause
-                               (handle-audit params result))))))]
-
-      (if-not (::audit/skip mdata)
-        (with-meta handle-request mdata)
-        f))
+    (if-not (::audit/skip mdata)
+      (with-meta
+        (fn [cfg params]
+          (let [result (f cfg params)
+                event  (prepare-audit-event cfg mdata params result)]
+            (audit/submit! cfg event)
+            result))
+        mdata)
+      f)
     f))
 
 (defn- wrap-spec-conform
   [_ f mdata]
   (let [spec (or (::sv/spec mdata) (s/spec any?))]
     (fn [cfg params]
-      (let [params (ex/try! (us/conform spec params))]
-        (if (ex/exception? params)
-          (p/rejected params)
-          (f cfg params))))))
+      (let [params (us/conform spec params)]
+        (f cfg params)))))
 
 (defn- wrap-all
   [cfg f mdata]
   (as-> f $
-    (wrap-dispatch cfg $ mdata)
     (wrap-metrics cfg $ mdata)
-    ;; (cond/wrap cfg $ mdata)
+    (cond/wrap cfg $ mdata)
     (retry/wrap-retry cfg $ mdata)
-    ;; (climit/wrap cfg $ mdata)
+    (climit/wrap cfg $ mdata)
     ;; (rlimit/wrap cfg $ mdata)
     (wrap-audit cfg $ mdata)
     (wrap-spec-conform cfg $ mdata)
@@ -287,8 +260,13 @@
 (defn- wrap
   [cfg f mdata]
   (l/debug :hint "register method" :name (::sv/name mdata))
-  (let [f (wrap-all cfg f mdata)]
-    (with-meta #(f cfg %) mdata)))
+  (let [f (wrap-all cfg f mdata)
+        x (px/resolve-executor :vthread)]
+    (with-meta
+      (fn [params]
+        (px/with-dispatch x
+          (f cfg params)))
+      mdata)))
 
 (defn- process-method
   [cfg vfn]

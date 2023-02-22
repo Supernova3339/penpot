@@ -36,6 +36,7 @@
    [app.storage.s3 :as-alias sto.s3]
    [app.util.time :as dt]
    [app.worker :as-alias wrk]
+   [promesa.exec :as px]
    [cuerdas.core :as str]
    [integrant.core :as ig])
   (:gen-class))
@@ -102,15 +103,15 @@
     ::mdef/labels ["name"]
     ::mdef/type :summary}
 
-   :rpc-climit-queue-size
-   {::mdef/name "penpot_rpc_climit_queue_size"
-    ::mdef/help "Current number of queued submissions on the CLIMIT."
+   :rpc-climit-queue
+   {::mdef/name "penpot_rpc_climit_queue"
+    ::mdef/help "Current number of queued submissions."
     ::mdef/labels ["name"]
     ::mdef/type :gauge}
 
-   :rpc-climit-concurrency
-   {::mdef/name "penpot_rpc_climit_concurrency"
-    ::mdef/help "Current number of used concurrency capacity on the CLIMIT"
+   :rpc-climit-permits
+   {::mdef/name "penpot_rpc_climit_permits"
+    ::mdef/help "Current number of available permits"
     ::mdef/labels ["name"]
     ::mdef/type :gauge}
 
@@ -174,12 +175,13 @@
 
    ;; Default thread pool for IO operations
    ::wrk/executor
-   {::wrk/parallelism (cf/get :default-executor-parallelism 100)}
+   {::wrk/parallelism (cf/get :default-executor-parallelism 8)
+    ::wrk/type :cached}
 
-   ::wrk/monitor
-   {::mtx/metrics  (ig/ref ::mtx/metrics)
-    ::wrk/name     "default"
-    ::wrk/executor (ig/ref ::wrk/executor)}
+   ;; ::wrk/monitor
+   ;; {::mtx/metrics  (ig/ref ::mtx/metrics)
+   ;;  ::wrk/name     "default"
+   ;;  ::wrk/executor (ig/ref ::wrk/executor)}
 
    :app.migrations/migrations
    {::db/pool (ig/ref ::db/pool)}
