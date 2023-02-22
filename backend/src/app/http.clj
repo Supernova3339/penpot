@@ -74,7 +74,7 @@
                  :http/max-multipart-body-size (::max-multipart-body-size cfg)
                  :xnio/io-threads (or (::io-threads cfg) (px/get-available-processors))
                  :xnio/worker-threads (or (::worker-threads cfg)
-                                          (* (px/get-available-processors) 2))
+                                          (* (px/get-available-processors) 1))
                  :xnio/dispatch true
                  :ring/async true}
 
