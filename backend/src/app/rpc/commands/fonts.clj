@@ -107,51 +107,45 @@
     (create-font-variant cfg (assoc params :profile-id profile-id))))
 
 (defn create-font-variant
-  [{:keys [::sto/storage ::db/pool ::wrk/executor ::rpc/climit]} {:keys [data] :as params}]
+  [{:keys [::sto/storage ::db/pool ::wrk/executor] :as cfg} {:keys [data] :as params}]
   (letfn [(generate-missing! [data]
-            (climit/with-dispatch! {::climit/instance climit
-                                    ::climit/queue :process-font
-                                    ::climit/executor executor}
-              (media/run {:cmd :generate-fonts :input data})))
+            (let [data (media/run {:cmd :generate-fonts :input data})]
+              (when (and (not (contains? data "font/otf"))
+                         (not (contains? data "font/ttf"))
+                         (not (contains? data "font/woff"))
+                         (not (contains? data "font/woff2")))
+                (ex/raise :type :validation
+                          :code :invalid-font-upload
+                          :hint "invalid font upload, unable to generate missing font assets"))
+              data))
 
-          ;; Function responsible of calculating cryptographyc hash of
-          ;; the provided data.
-          (calculate-hash [data]
-            (px/with-dispatch! executor
-              (sto/calculate-hash data)))
-
-          (validate-data! [data]
-            (when (and (not (contains? data "font/otf"))
-                       (not (contains? data "font/ttf"))
-                       (not (contains? data "font/woff"))
-                       (not (contains? data "font/woff2")))
-              (ex/raise :type :validation
-                        :code :invalid-font-upload)))
-
-          (persist-font! [data mtype]
+          (prepare-font [data mtype]
             (when-let [resource (get data mtype)]
-              (let [hash    (calculate-hash resource)
+              (let [hash    (sto/calculate-hash resource)
                     content (-> (sto/content resource)
                                 (sto/wrap-with-hash hash))]
-                (p/await!
-                 (sto/put-object! storage {::sto/content content
-                                           ::sto/touched-at (dt/now)
-                                           ::sto/deduplicate? true
-                                           :content-type mtype
-                                           :bucket "team-font-variant"})))))
+                {::sto/content content
+                 ::sto/touched-at (dt/now)
+                 ::sto/deduplicate? true
+                 :content-type mtype
+                 :bucket "team-font-variant"})))
 
-          (persist-fonts! [data]
-            (let [otf   (persist-font! data "font/otf")
-                  ttf   (persist-font! data "font/ttf")
-                  woff1 (persist-font! data "font/woff")
-                  woff2 (persist-font! data "font/woff2")]
-              (d/without-nils
-               {:otf otf
-                :ttf ttf
-                :woff1 woff1
-                :woff2 woff2})))
+          (persist-fonts-files! [data]
+            (let [otf-params (prepare-font data "font/otf")
+                  ttf-params (prepare-font data "font/ttf")
+                  wf1-params (prepare-font data "font/woff")
+                  wf2-params (prepare-font data "font/woff2")]
+              (cond-> {}
+                (some? otf-params)
+                (assoc :otf (p/await! (sto/put-object! storage otf-params)))
+                (some? ttf-params)
+                (assoc :ttf (p/await! (sto/put-object! storage ttf-params)))
+                (some? wf1-params)
+                (assoc :woff1 (p/await! (sto/put-object! storage wf1-params)))
+                (some? wf2-params)
+                (assoc :woff2 (p/await! (sto/put-object! storage wf2-params))))))
 
-          (insert-into-db [{:keys [woff1 woff2 otf ttf]}]
+          (insert-font-variant! [{:keys [woff1 woff2 otf ttf]}]
             (db/insert! pool :team-font-variant
                         {:id (uuid/next)
                          :team-id (:team-id params)
@@ -165,19 +159,11 @@
                          :ttf-file-id (:id ttf)}))
           ]
 
-    (let [fonts (generate-missing! data)
-          _     (validate-data! fonts)]
-
-      (validate-data! fonts)
-      (let(persist-fonts! fonts)
-
-    (->> (generate-fonts data)
-         (p/fmap validate-data)
-         (p/mcat executor persist-fonts)
-         (p/fmap executor insert-into-db)
-         (p/fmap (fn [result]
-                   (let [params (update params :data (comp vec keys))]
-                     (rph/with-meta result {::audit/replace-props params})))))))
+    (let [climit (climit/configure cfg :process-font executor)
+          data   (climit/run! climit (partial generate-missing! data))
+          assets (persist-fonts-files! data)
+          result (insert-font-variant! assets)]
+      (vary-meta result assoc ::audit/replace-props (update params :data (comp vec keys))))))
 
 ;; --- UPDATE FONT FAMILY
 

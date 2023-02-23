@@ -197,27 +197,26 @@
 
 (defn- generate-thumbnail!
   [file]
-  (let [input (media/run {:cmd :info :input file})
-        thumb (media/run {:cmd :profile-thumbnail
-                          :format :jpeg
-                          :quality 85
-                          :width 256
-                          :height 256
-                          :input input})
-        hash  (sto/calculate-hash (:data thumb))]
-
-    (-> (sto/content (:data thumb) (:size thumb))
-        (sto/wrap-with-hash hash))))
+  (let [input   (media/run {:cmd :info :input file})
+        thumb   (media/run {:cmd :profile-thumbnail
+                            :format :jpeg
+                            :quality 85
+                            :width 256
+                            :height 256
+                            :input input})
+        hash    (sto/calculate-hash (:data thumb))
+        content (-> (sto/content (:data thumb) (:size thumb))
+                    (sto/wrap-with-hash hash))]
+    {::sto/content content
+     ::sto/deduplicate? true
+     :bucket "profile"
+     :content-type (:mtype thumb)}))
 
 (defn upload-photo
   [{:keys [::sto/storage ::wrk/executor] :as cfg} {:keys [file]}]
-  (let [content (-> (climit/configure cfg :process-image executor)
-                    (climit/run! (partial generate-thumbnail! file)))]
-    (p/await!
-     (sto/put-object! storage {::sto/content content
-                               ::sto/deduplicate? true
-                               :bucket "profile"
-                               :content-type (:mtype thumb)}))))
+  (let [params (-> (climit/configure cfg :process-image executor)
+                   (climit/run! (partial generate-thumbnail! file)))]
+    (p/await! (sto/put-object! storage params))))
 
 
 ;; --- MUTATION: Request Email Change

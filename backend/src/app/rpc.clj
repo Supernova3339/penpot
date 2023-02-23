@@ -178,50 +178,6 @@
           (f cfg params))))
     f))
 
-;; FIXME: cfg mdata? can the be the same?
-
-(defn- prepare-audit-event
-  [cfg mdata params result]
-  (let [resultm    (meta result)
-        request    (::http/request params)
-        profile-id (or (::audit/profile-id resultm)
-                       (:profile-id result)
-                       (::profile-id params)
-                       uuid/zero)
-
-        props      (-> (or (::audit/replace-props resultm)
-                           (-> params
-                               (merge (::audit/props resultm))
-                               (dissoc :profile-id)
-                               (dissoc :type)))
-
-                       (audit/clean-props))]
-    {:type (or (::audit/type resultm)
-               (::type cfg))
-     :name (or (::audit/name resultm)
-               (::sv/name mdata))
-     :profile-id profile-id
-     :ip-addr (some-> request audit/parse-client-ip)
-     :props props
-
-     ;; NOTE: for batch-key lookup we need the params as-is
-     ;; because the rpc api does not need to know the
-     ;; audit/webhook specific object layout.
-     ::params (dissoc params ::http/request)
-
-     ::webhooks/batch-key
-     (or (::webhooks/batch-key mdata)
-         (::webhooks/batch-key resultm))
-
-     ::webhooks/batch-timeout
-     (or (::webhooks/batch-timeout mdata)
-         (::webhooks/batch-timeout resultm))
-
-     ::webhooks/event?
-     (or (::webhooks/event? mdata)
-         (::webhooks/event? resultm)
-         false)}))
-
 (defn- wrap-audit
   [cfg f mdata]
   (if (or (contains? cf/flags :webhooks)
@@ -229,9 +185,9 @@
     (if-not (::audit/skip mdata)
       (with-meta
         (fn [cfg params]
-          (let [result (f cfg params)
-                event  (prepare-audit-event cfg mdata params result)]
-            (audit/submit! cfg event)
+          (let [result (f cfg params)]
+            (->> (audit/prepare-event cfg mdata params result)
+                 (audit/submit! cfg))
             result))
         mdata)
       f)
