@@ -51,8 +51,8 @@ export OPTIONS="
        -J-Djdk.attach.allowAttachSelf \
        -J-Dlog4j2.configurationFile=log4j2-devenv.xml \
        -J-Xms50m \
-       -J-Xmx1024m \
-       -J-XX:+UseZGC \
+       -J-Xmx1224m \
+       -J-XX:+UseShenandoahGC \
        -J-XX:-OmitStackTraceInFastThrow \
        -J-XX:+UnlockDiagnosticVMOptions \
        -J-XX:+DebugNonSafepoints \

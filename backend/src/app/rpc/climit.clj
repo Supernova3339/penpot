@@ -6,6 +6,7 @@
 
 (ns app.rpc.climit
   "Concurrencly limiter for RPC."
+  (:refer-clojure :exclude [run!])
   (:require
    [app.common.data :as d]
    [app.common.exceptions :as ex]
@@ -14,6 +15,7 @@
    [app.config :as cf]
    [app.metrics :as mtx]
    [app.rpc :as-alias rpc]
+   [app.rpc.climit.config :as-alias config]
    [app.util.services :as-alias sv]
    [app.util.time :as dt]
    [app.worker :as-alias wrk]
@@ -62,12 +64,14 @@
         (removalListener listener)
         (build loader))))
 
-(s/def ::permits ::us/integer)
-(s/def ::queue ::us/integer)
-(s/def ::timeout ::us/integer)
+(s/def ::config/permits ::us/integer)
+(s/def ::config/queue ::us/integer)
+(s/def ::config/timeout ::us/integer)
 (s/def ::config
   (s/map-of keyword?
-            (s/keys :opt-un [::permits ::queue ::timeout])))
+            (s/keys :opt-un [::config/permits
+                             ::config/queue
+                             ::config/timeout])))
 
 (defmethod ig/prep-key ::rpc/climit
   [_ cfg]
@@ -78,22 +82,23 @@
   (s/keys :req [::wrk/executor ::mtx/metrics ::path]))
 
 (defmethod ig/init-key ::rpc/climit
-  [_ {:keys [::path ::mtx/metrics] :as cfg}]
+  [_ {:keys [::path ::mtx/metrics ::wrk/executor] :as cfg}]
   (when (contains? cf/flags :rpc-climit)
-    (if-let [params (some->> path slurp edn/read-string)]
-      (do
-        (l/info :hint "initializing concurrency limit" :config (str path))
-        (us/verify! ::config params)
-        {::cache (create-cache cfg params)
-         ::config params
-         ::mtx/metrics metrics})
-
-      (l/warn :hint "unable to load configuration" :config (str path)))))
+    (when-let [params (some->> path slurp edn/read-string)]
+      (l/info :hint "initializing concurrency limit" :config (str path))
+      (us/verify! ::config params)
+      {::cache (create-cache cfg params)
+       ::config params
+       ::mtx/metrics metrics})))
 
 (s/def ::cache #(instance? LoadingCache %))
+(s/def ::queue #(instance? LoadingCache %))
+(s/def ::instance
+  (s/keys :req [::cache ::config]
+          :opt [::wrk/executor  ::queue]))
+
 (s/def ::rpc/climit
-  (s/nilable
-   (s/keys :req [::cache ::config])))
+  (s/nilable ::instance))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; PUBLIC API
@@ -158,27 +163,39 @@
       (finally
         (measure! (pbh/get-stats limiter))))))
 
+
+(defn run!
+  [{:keys [::queue ::cache ::wrk/executor ::mtx/metrics]} f]
+  (let [f (if executor (fn [] (p/await! (px/submit! executor f))) f)]
+    (if (and cache queue)
+      (invoke! cache metrics queue nil f)
+      (f))))
+
 (defmacro with-dispatch!
-  "Dispatch blocking operation to a separated thread protected with
-  the specified semaphore."
-  [opts & body]
-  (let [f-sym    (gensym "f")
-        executor (::executor opts)
-        queue    (::queue opts)
-        instance (::instance opts)]
-    `(let [cache#   (get ~instance :app.rpc.climit/cache)
-           metrics# (get ~instance :app.metrics/metrics)
-           ~f-sym   (fn [] ~@body)]
-       (invoke! cache# metrics# ~queue nil
-                ~(if executor
-                   `(fn [] (p/await! (px/submit! ~executor ~f-sym)))
-                   f-sym)))))
+  "Dispatch blocking operation to a separated thread protected with the
+  specified concurrency limiter. If climit is not active, the function
+  will be scheduled to execute without concurrency monitoring."
+  [instance & body]
+  `(run! ~instance (fn [] ~@body)))
 
 (defmacro with-dispatch
   "Dispatch blocking operation to a separated thread protected with
-  the specified semaphore."
+  the specified semaphore.
+  DEPRECATED"
   [& params]
   `(with-dispatch! ~@params))
+
+(defn configure
+  ([cfg-or-instance queue]
+   (let [instance (or (::rpc/climit cfg-or-instance) cfg-or-instance)]
+     (us/assert! ::rpc/climit instance)
+     (assoc instance ::queue queue)))
+  ([cfg-or-instance queue executor]
+   (let [instance (or (::rpc/climit cfg-or-instance) cfg-or-instance)]
+     (us/assert! ::rpc/climit instance)
+     (-> instance
+         (assoc ::queue queue)
+         (assoc ::wrk/executor executor)))))
 
 (def noop-fn (constantly nil))
 

@@ -195,50 +195,29 @@
                          :file-path (str (:path file))
                          :file-mtype (:mtype file)}}))))
 
-(def cache (volatile! nil))
-
-(defn upload-photo
-  [{:keys [::sto/storage ::wrk/executor ::rpc/climit] :as cfg} {:keys [file]}]
-  (letfn [(get-info [content]
-            (climit/with-dispatch! {::climit/instance climit
-                                    ::climit/queue :process-image
-                                    ::climit/executor executor}
-              (prn "get-info" (px/current-thread))
-              (vreset! cache (reduce + 0 (range 91500000)))
-              (media/run {:cmd :info :input content})))
-
-          (generate-thumbnail [info]
-            (climit/with-dispatch! {::climit/instance climit
-                                    ::climit/queue :process-image
-                                    ::climit/executor executor}
-              (prn "generate-thumbnail" (px/current-thread))
-              (vreset! cache (reduce + 0 (range 91500000)))
-              (media/run {:cmd :profile-thumbnail
+(defn- generate-thumbnail!
+  [file]
+  (let [input (media/run {:cmd :info :input file})
+        thumb (media/run {:cmd :profile-thumbnail
                           :format :jpeg
                           :quality 85
                           :width 256
                           :height 256
-                          :input info})))
+                          :input input})
+        hash  (sto/calculate-hash (:data thumb))]
 
-          ;; Function responsible of calculating cryptographyc hash of
-          ;; the provided data.
-          (calculate-hash [data]
-            (px/with-dispatch! executor
-              (prn "calculate-hash" (px/current-thread))
-              (sto/calculate-hash data)))]
+    (-> (sto/content (:data thumb) (:size thumb))
+        (sto/wrap-with-hash hash))))
 
-    (prn "upload-photo" (px/current-thread))
-    (let [info    (get-info file)
-          thumb   (generate-thumbnail info)
-          hash    (calculate-hash (:data thumb))
-          content (-> (sto/content (:data thumb) (:size thumb))
-                      (sto/wrap-with-hash hash))]
-
-      (p/await!
-       (sto/put-object! storage {::sto/content content
-                                 ::sto/deduplicate? true
-                                 :bucket "profile"
-                                 :content-type (:mtype thumb)})))))
+(defn upload-photo
+  [{:keys [::sto/storage ::wrk/executor] :as cfg} {:keys [file]}]
+  (let [content (-> (climit/configure cfg :process-image executor)
+                    (climit/run! (partial generate-thumbnail! file)))]
+    (p/await!
+     (sto/put-object! storage {::sto/content content
+                               ::sto/deduplicate? true
+                               :bucket "profile"
+                               :content-type (:mtype thumb)}))))
 
 
 ;; --- MUTATION: Request Email Change

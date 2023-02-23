@@ -108,42 +108,43 @@
 
 (defn create-font-variant
   [{:keys [::sto/storage ::db/pool ::wrk/executor ::rpc/climit]} {:keys [data] :as params}]
-  (letfn [(generate-fonts [data]
-            (climit/with-dispatch (:process-font climit)
+  (letfn [(generate-missing! [data]
+            (climit/with-dispatch! {::climit/instance climit
+                                    ::climit/queue :process-font
+                                    ::climit/executor executor}
               (media/run {:cmd :generate-fonts :input data})))
 
           ;; Function responsible of calculating cryptographyc hash of
           ;; the provided data.
           (calculate-hash [data]
-            (px/with-dispatch executor
+            (px/with-dispatch! executor
               (sto/calculate-hash data)))
 
-          (validate-data [data]
+          (validate-data! [data]
             (when (and (not (contains? data "font/otf"))
                        (not (contains? data "font/ttf"))
                        (not (contains? data "font/woff"))
                        (not (contains? data "font/woff2")))
               (ex/raise :type :validation
-                        :code :invalid-font-upload))
-            data)
+                        :code :invalid-font-upload)))
 
-          (persist-font-object [data mtype]
+          (persist-font! [data mtype]
             (when-let [resource (get data mtype)]
-              (p/let [hash    (calculate-hash resource)
-                      content (-> (sto/content resource)
-                                  (sto/wrap-with-hash hash))]
-                (sto/put-object! storage {::sto/content content
-                                          ::sto/touched-at (dt/now)
-                                          ::sto/deduplicate? true
-                                          :content-type mtype
-                                          :bucket "team-font-variant"}))))
+              (let [hash    (calculate-hash resource)
+                    content (-> (sto/content resource)
+                                (sto/wrap-with-hash hash))]
+                (p/await!
+                 (sto/put-object! storage {::sto/content content
+                                           ::sto/touched-at (dt/now)
+                                           ::sto/deduplicate? true
+                                           :content-type mtype
+                                           :bucket "team-font-variant"})))))
 
-          (persist-fonts [data]
-            (p/let [otf   (persist-font-object data "font/otf")
-                    ttf   (persist-font-object data "font/ttf")
-                    woff1 (persist-font-object data "font/woff")
-                    woff2 (persist-font-object data "font/woff2")]
-
+          (persist-fonts! [data]
+            (let [otf   (persist-font! data "font/otf")
+                  ttf   (persist-font! data "font/ttf")
+                  woff1 (persist-font! data "font/woff")
+                  woff2 (persist-font! data "font/woff2")]
               (d/without-nils
                {:otf otf
                 :ttf ttf
@@ -163,6 +164,12 @@
                          :otf-file-id (:id otf)
                          :ttf-file-id (:id ttf)}))
           ]
+
+    (let [fonts (generate-missing! data)
+          _     (validate-data! fonts)]
+
+      (validate-data! fonts)
+      (let(persist-fonts! fonts)
 
     (->> (generate-fonts data)
          (p/fmap validate-data)

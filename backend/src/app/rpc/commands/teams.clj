@@ -85,7 +85,7 @@
 
 (sv/defmethod ::get-teams
   {::doc/added "1.17"}
-  [{:keys [::db/pool ::wrk/executor] :as cfg} {:keys [::rpc/profile-id] :as params}]
+  [{:keys [::db/pool] :as cfg} {:keys [::rpc/profile-id] :as params}]
   (with-open [conn (db/open pool)]
     (retrieve-teams conn profile-id)))
 
