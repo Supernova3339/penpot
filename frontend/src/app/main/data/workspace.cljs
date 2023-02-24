@@ -177,56 +177,62 @@
       (watch [_ _ stream]
         (let [team-id  (:team-id project)
               stoper   (rx/filter (ptk/type? ::bundle-fetched) stream)]
-          (->> (rx/merge
+          (->> (rx/concat
                 ;; Initialize notifications & load team fonts
                 (rx/of (dwn/initialize team-id id)
-                       (dwsl/initialize)
-                       (df/load-team-fonts team-id))
+                       (dwsl/initialize))
 
-                ;; Load all pages, independently if they are pointers or already
-                ;; resolved values.
-                (->> (rx/from (seq (:pages-index data)))
-                     (rx/merge-map
-                      (fn [[_ page :as kp]]
-                        (if (t/pointer? page)
-                          (resolve-pointer id kp)
-                          (rx/of kp))))
-                     (rx/merge-map
-                      (fn [[id page]]
-                        (let [page (update page :objects ctst/start-page-index)]
-                          (->> (uw/ask! {:cmd :initialize-page-index :page page})
-                               (rx/map (constantly [id page]))))))
-                     (rx/reduce conj {})
-                     (rx/map (fn [pages-index]
-                               (-> data
-                                   (assoc :pages-index pages-index)
-                                   (workspace-data-loaded)))))
-
-                ;; Once workspace data is loaded, proceed asynchronously load
-                ;; the local library and all referenced libraries, without
-                ;; blocking the main workspace load process.
+                (rx/of (df/load-team-fonts team-id))
                 (->> stream
-                     (rx/filter (ptk/type? ::workspace-data-loaded))
+                     (rx/filter (ptk/type? :app.main.data.fonts/team-fonts-loaded))
                      (rx/take 1)
-                     (rx/merge-map
-                      (fn [_]
-                        (rx/merge
-                         (rx/of (workspace-initialized))
+                     (rx/ignore))
 
-                         (->> data
-                              (filter (comp t/pointer? val))
-                              (resolve-pointers id)
-                              (rx/map workspace-data-pointers-loaded))
+                (rx/merge
+                 ;; Load all pages, independently if they are pointers or already
+                 ;; resolved values.
+                 (->> (rx/from (seq (:pages-index data)))
+                      (rx/merge-map
+                       (fn [[_ page :as kp]]
+                         (if (t/pointer? page)
+                           (resolve-pointer id kp)
+                           (rx/of kp))))
+                      (rx/merge-map
+                       (fn [[id page]]
+                         (let [page (update page :objects ctst/start-page-index)]
+                           (->> (uw/ask! {:cmd :initialize-page-index :page page})
+                                (rx/map (constantly [id page]))))))
+                      (rx/reduce conj {})
+                      (rx/map (fn [pages-index]
+                                (-> data
+                                    (assoc :pages-index pages-index)
+                                    (workspace-data-loaded)))))
 
-                         (->> (rp/cmd! :get-file-libraries {:file-id id :features features})
-                              (rx/mapcat identity)
-                              (rx/mapcat
-                               (fn [{:keys [id data] :as file}]
-                                 (->> (filter (comp t/pointer? val) data)
-                                      (resolve-pointers id)
-                                      (rx/map #(update file :data merge %)))))
-                              (rx/reduce conj [])
-                              (rx/map libraries-fetched)))))))
+                 ;; Once workspace data is loaded, proceed asynchronously load
+                 ;; the local library and all referenced libraries, without
+                 ;; blocking the main workspace load process.
+                 (->> stream
+                      (rx/filter (ptk/type? ::workspace-data-loaded))
+                      (rx/take 1)
+                      (rx/merge-map
+                       (fn [_]
+                         (rx/merge
+                          (rx/of (workspace-initialized))
+
+                          (->> data
+                               (filter (comp t/pointer? val))
+                               (resolve-pointers id)
+                               (rx/map workspace-data-pointers-loaded))
+
+                          (->> (rp/cmd! :get-file-libraries {:file-id id :features features})
+                               (rx/mapcat identity)
+                               (rx/mapcat
+                                (fn [{:keys [id data] :as file}]
+                                  (->> (filter (comp t/pointer? val) data)
+                                       (resolve-pointers id)
+                                       (rx/map #(update file :data merge %)))))
+                               (rx/reduce conj [])
+                               (rx/map libraries-fetched))))))))
 
                (rx/take-until stoper)))))))
 
@@ -429,7 +435,7 @@
             name    (cp/generate-unique-name unames (:name page))
 
             no_thumbnails_objects (->> (:objects page)
-                                      (d/mapm (fn [_ val] (dissoc val :use-for-thumbnail?))))
+                                       (d/mapm (fn [_ val] (dissoc val :use-for-thumbnail?))))
 
             page (-> page (assoc :name name :id id :objects no_thumbnails_objects))
 
@@ -1099,13 +1105,13 @@
                 qparams         {:page-id page-id}]
                 ;; qparams         {:page-id page-id :layout :assets}]
             (rx/merge
-              (rx/of (rt/nav :workspace pparams qparams))
-              (->> stream
-                   (rx/filter (ptk/type? ::dwv/initialize-viewport))
-                   (rx/take 1)
-                   (rx/mapcat #(do
-                                 (on-page-selected)
-                                 (rx/of (dws/select-shapes (lks/set shape-id)))))))))))))
+             (rx/of (rt/nav :workspace pparams qparams))
+             (->> stream
+                  (rx/filter (ptk/type? ::dwv/initialize-viewport))
+                  (rx/take 1)
+                  (rx/mapcat #(do
+                                (on-page-selected)
+                                (rx/of (dws/select-shapes (lks/set shape-id)))))))))))))
 
 (defn go-to-component
   [component-id]
@@ -1442,7 +1448,7 @@
 
 (defn same-frame-from-selected? [state frame-id]
   (let [selected (wsh/lookup-selected state)]
-     (contains? frame-id (first selected))))
+    (contains? frame-id (first selected))))
 
 (defn frame-same-size?
   [paste-obj frame-obj]
@@ -1544,7 +1550,7 @@
                               ;;    - Respect the distance of the object to the right and bottom in the original frame
                                 (gpt/point paste-x paste-y))]
                     [frame-id frame-id delta]))
-                
+
                 (empty? page-selected)
                 (let [frame-id (ctst/top-nested-frame page-objects mouse-pos)
                       delta    (gpt/subtract mouse-pos orig-pos)]
@@ -1837,8 +1843,8 @@
                  (dwm/create-shapes-img pos media-obj))]
 
     (->> (rx/concat
-           (rx/of (update-remove-graphics index))
-           (rx/map process-shapes shapes))
+          (rx/of (update-remove-graphics index))
+          (rx/map process-shapes shapes))
          (rx/catch #(do
                       (log/error :msg (str "Error removing " (:name media-obj))
                                  :hint (ex-message %)
@@ -1872,15 +1878,15 @@
             (ctst/generate-shape-grid media-points start-pos grid-gap)]
 
         (rx/concat
-          (rx/of (modal/show {:type :remove-graphics-dialog :file-name file-name})
-                 (initialize-remove-graphics (count media)))
-          (when new-page?
-            (rx/of (dch/commit-changes (-> (pcb/empty-changes it)
-                                           (pcb/set-save-undo? false)
-                                           (pcb/add-page (:id page) page)))))
-          (rx/mapcat (partial remove-graphic it file-data' page)
-                     (rx/from (d/enumerate (d/zip media shape-grid))))
-          (rx/of (complete-remove-graphics)))))))
+         (rx/of (modal/show {:type :remove-graphics-dialog :file-name file-name})
+                (initialize-remove-graphics (count media)))
+         (when new-page?
+           (rx/of (dch/commit-changes (-> (pcb/empty-changes it)
+                                          (pcb/set-save-undo? false)
+                                          (pcb/add-page (:id page) page)))))
+         (rx/mapcat (partial remove-graphic it file-data' page)
+                    (rx/from (d/enumerate (d/zip media shape-grid))))
+         (rx/of (complete-remove-graphics)))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Read only
