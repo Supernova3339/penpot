@@ -6,6 +6,7 @@
 
 (ns app.main.ui.workspace.viewport.widgets
   (:require
+   [app.common.pages.helpers :as cph]
    [app.common.data :as d]
    [app.common.data.macros :as dm]
    [app.common.geom.point :as gpt]
@@ -55,8 +56,11 @@
         drawing     (mf/deref refs/workspace-drawing)
         drawing-obj (:object drawing)
         shape       (or drawing-obj (-> selected first))]
-    (when (or (and (= (count selected) 1) (= (:id shape) edition) (not= :text (:type shape)))
-              (and (some? drawing-obj) (= :path (:type drawing-obj))
+    (when (or (and (= (count selected) 1)
+                   (= (:id shape) edition)
+                   (cph/path-shape? shape))
+              (and (some? drawing-obj)
+                   (cph/path-shape? drawing-obj)
                    (not= :curve (:tool drawing))))
       [:div.viewport-actions
        [:& path-actions {:shape shape}]])))

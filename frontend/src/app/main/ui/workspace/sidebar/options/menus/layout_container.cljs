@@ -6,6 +6,7 @@
 
 (ns app.main.ui.workspace.sidebar.options.menus.layout-container
   (:require
+   [app.main.refs :as refs]
    [app.common.data :as d]
    [app.common.data.macros :as dm]
    [app.main.data.workspace :as udw]
@@ -343,14 +344,24 @@
                         :disabled (and (= :nowrap wrap-type) (not is-col?))}]]]])
 
 (mf/defc grid-edit-mode
-  [{:keys [active toggle-edit-mode] :as props}]
-  [:*
-   [:button.tooltip.tooltip-bottom-left
-    {:class  (dom/classnames :active  (= active true))
-     :alt    "Grid edit mode"
-     :on-click #(toggle-edit-mode)
-     :style {:padding 0}}
-    i/grid-layout-mode]])
+  [{:keys [id] :as props}]
+  (let [edition (mf/deref refs/selected-edition)
+        active? (= id edition)
+
+        toggle-edit-mode
+        (mf/use-callback
+         (mf/deps id edition)
+         (fn []
+           (if-not active?
+             (st/emit! (udw/start-edition-mode id))
+             (st/emit! :interrupt))))]
+
+    [:button.tooltip.tooltip-bottom-left
+     {:class  (dom/classnames :active  active?)
+      :alt    "Grid edit mode"
+      :on-click #(toggle-edit-mode)
+      :style {:padding 0}}
+     i/grid-layout-mode]))
 
 (mf/defc align-grid-row
   [{:keys [is-col? align-items set-align] :as props}]
@@ -687,10 +698,9 @@
                                      :set-direction #(set-direction dir :grid)
                                      :icon? false}])]]
 
-              [:div.edit-mode
-               [:& grid-edit-mode
-                {:active false
-                 :toggle-edit-mode ()}]]]]
+              (when (= 1 (count ids))
+                [:div.edit-mode
+                 [:& grid-edit-mode {:id (first ids)}]])]]
 
             [:div.layout-row
              [:div.align-items-grid.row-title "Align"]
