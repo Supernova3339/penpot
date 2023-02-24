@@ -82,7 +82,7 @@
   {::rscript/name ::window-rate-limit
    ::rscript/path "app/rpc/rlimit/window.lua"})
 
-(def enabled?
+(def enabled
   "Allows on runtime completely disable rate limiting."
   (atom true))
 
@@ -138,90 +138,72 @@
 
 (defmethod process-limit :bucket
   [redis user-id now {:keys [::key ::params ::service ::capacity ::interval ::rate] :as limit}]
-  (let [script (-> bucket-rate-limit-script
-                   (assoc ::rscript/keys [(str key "." service "." user-id)])
-                   (assoc ::rscript/vals (conj params (dt/->seconds now))))]
-    (->> (rds/eval! redis script)
-         (p/fmap (fn [result]
-                   (let [allowed?  (boolean (nth result 0))
-                         remaining (nth result 1)
-                         reset     (* (/ (inst-ms interval) rate)
-                                      (- capacity remaining))]
-                     (l/trace :hint "limit processed"
-                              :service service
-                              :limit (name (::name limit))
-                              :strategy (name (::strategy limit))
-                              :opts (::opts limit)
-                             :allowed? allowed?
-                             :remaining remaining)
-                     (-> limit
-                         (assoc ::lresult/allowed? allowed?)
-                         (assoc ::lresult/reset (dt/plus now reset))
-                         (assoc ::lresult/remaining remaining))))))))
+  (let [script    (-> bucket-rate-limit-script
+                      (assoc ::rscript/keys [(str key "." service "." user-id)])
+                      (assoc ::rscript/vals (conj params (dt/->seconds now))))
+        result    (rds/eval! redis script)
+        allowed?  (boolean (nth result 0))
+        remaining (nth result 1)
+        reset     (* (/ (inst-ms interval) rate)
+                     (- capacity remaining))]
+    (l/trace :hint "limit processed"
+             :service service
+             :limit (name (::name limit))
+             :strategy (name (::strategy limit))
+             :opts (::opts limit)
+             :allowed? allowed?
+             :remaining remaining)
+    (-> limit
+        (assoc ::lresult/allowed? allowed?)
+        (assoc ::lresult/reset (dt/plus now reset))
+        (assoc ::lresult/remaining remaining))))
 
 (defmethod process-limit :window
   [redis user-id now {:keys [::nreq ::unit ::key ::service] :as limit}]
-  (let [ts     (dt/truncate now unit)
-        ttl    (dt/diff now (dt/plus ts {unit 1}))
-        script (-> window-rate-limit-script
-                   (assoc ::rscript/keys [(str key "." service "." user-id "." (dt/format-instant ts))])
-                   (assoc ::rscript/vals [nreq (dt/->seconds ttl)]))]
-    (->> (rds/eval! redis script)
-         (p/fmap (fn [result]
-                   (let [allowed?  (boolean (nth result 0))
-                         remaining (nth result 1)]
-                     (l/trace :hint "limit processed"
-                              :service service
-                              :limit (name (::name limit))
-                              :strategy (name (::strategy limit))
-                              :opts (::opts limit)
-                              :allowed? allowed?
-                             :remaining remaining)
-                     (-> limit
-                         (assoc ::lresult/allowed? allowed?)
-                         (assoc ::lresult/remaining remaining)
-                         (assoc ::lresult/reset (dt/plus ts {unit 1})))))))))
+  (let [ts        (dt/truncate now unit)
+        ttl       (dt/diff now (dt/plus ts {unit 1}))
+        script    (-> window-rate-limit-script
+                      (assoc ::rscript/keys [(str key "." service "." user-id "." (dt/format-instant ts))])
+                      (assoc ::rscript/vals [nreq (dt/->seconds ttl)]))
+        result    (rds/eval! redis script)
+        allowed?  (boolean (nth result 0))
+        remaining (nth result 1)]
+    (l/trace :hint "limit processed"
+             :service service
+             :limit (name (::name limit))
+             :strategy (name (::strategy limit))
+             :opts (::opts limit)
+             :allowed? allowed?
+             :remaining remaining)
+    (-> limit
+        (assoc ::lresult/allowed? allowed?)
+        (assoc ::lresult/remaining remaining)
+        (assoc ::lresult/reset (dt/plus ts {unit 1})))))
 
 (defn- process-limits!
   [redis user-id limits now]
-  (->> (p/all (map (partial process-limit redis user-id now) limits))
-       (p/fmap (fn [results]
-                 (let [remaining (->> results
-                                      (d/index-by ::name ::lresult/remaining)
-                                      (uri/map->query-string))
-                       reset     (->> results
-                                      (d/index-by ::name (comp dt/->seconds ::lresult/reset))
-                                      (uri/map->query-string))
-                       rejected  (->> results
-                                      (filter (complement ::lresult/allowed?))
-                                      (first))]
+  (let [results   (map (partial process-limit redis user-id now) limits)
+        remaining (->> results
+                       (d/index-by ::name ::lresult/remaining)
+                       (uri/map->query-string))
+        reset     (->> results
+                       (d/index-by ::name (comp dt/->seconds ::lresult/reset))
+                       (uri/map->query-string))
+        rejected  (->> results
+                       (filter (complement ::lresult/allowed?))
+                       (first))]
 
-                   (when rejected
-                     (l/warn :hint "rejected rate limit"
-                             :user-id (str user-id)
-                             :limit-service (-> rejected ::service name)
-                             :limit-name (-> rejected ::name name)
-                             :limit-strategy (-> rejected ::strategy name)))
+    (when rejected
+      (l/warn :hint "rejected rate limit"
+              :user-id (str user-id)
+              :limit-service (-> rejected ::service name)
+              :limit-name (-> rejected ::name name)
+              :limit-strategy (-> rejected ::strategy name)))
 
-                   {:enabled? true
-                    :allowed? (not (some? rejected))
-                    :headers  {"x-rate-limit-remaining" remaining
-                               "x-rate-limit-reset" reset}})))))
-
-(defn- handle-response
-  [f cfg params result]
-  (if (:enabled? result)
-    (let [headers (:headers result)]
-      (if (:allowed? result)
-        (->> (f cfg params)
-             (p/fmap (fn [response]
-                       (vary-meta response update ::http/headers merge headers))))
-        (p/rejected
-         (ex/error :type :rate-limit
-                   :code :request-blocked
-                   :hint "rate limit reached"
-                   ::http/headers headers))))
-    (f cfg params)))
+    {:enabled? true
+     :allowed? (not (some? rejected))
+     :headers  {"x-rate-limit-remaining" remaining
+                "x-rate-limit-reset" reset}}))
 
 (defn- get-limits
   [state skey sname]
@@ -236,6 +218,26 @@
       (some-> request parse-client-ip)
       uuid/zero))
 
+(defn process-request!
+  [{:keys [::rpc/rlimit ::rds/redis ::skey ::sname] :as cfg} params]
+
+  (when-let [limits (get-limits rlimit skey sname)]
+    (let [redis  (rds/get-or-connect redis ::rpc/rlimit default-options)
+          uid    (get-uid params)
+          result (ex/try! (process-limits! redis uid limits (dt/now)))]
+
+      (cond
+        (ex/exception? result)
+        (do
+          (l/error :hint "error on processing rate-limit" :cause result)
+          {:enabled? false})
+
+        (contains? cf/flags :soft-rpc-rlimit)
+        {:enabled? false}
+
+        :else
+        result))))
+
 (defn wrap
   [{:keys [::rpc/rlimit ::rds/redis] :as cfg} f mdata]
   (us/assert! ::rpc/rlimit rlimit)
@@ -243,35 +245,23 @@
 
   (if rlimit
     (let [skey  (keyword (::rpc/type cfg) (->> mdata ::sv/spec name))
-          sname (str (::rpc/type cfg) "." (->> mdata ::sv/spec name))]
+          sname (str (::rpc/type cfg) "." (->> mdata ::sv/spec name))
+          cfg   (-> cfg
+                    (assoc ::skey skey)
+                    (assoc ::sname sname))]
 
       (fn [cfg params]
-        (if @enabled?
-          (try
-            (let [uid (get-uid params)
-                  rsp (when-let [limits (get-limits rlimit skey sname)]
-                        (let [redis (rds/get-or-connect redis ::rpc/rlimit default-options)
-                              rsp   (->> (process-limits! redis uid limits (dt/now))
-                                         (p/merr (fn [cause]
-                                                   ;; If we have an error on processing the rate-limit we just skip
-                                                   ;; it for do not cause service interruption because of redis
-                                                   ;; downtime or similar situation.
-                                                   (l/error :hint "error on processing rate-limit" :cause cause)
-                                                   (p/resolved {:enabled? false}))))]
-
-                          ;; If soft rate are enabled, we process the rate-limit but return unprotected
-                          ;; response.
-                          (if (contains? cf/flags :soft-rpc-rlimit)
-                            {:enabled? false}
-                            rsp)))]
-
-              (->> (p/promise rsp)
-                   (p/fmap #(or % {:enabled? false}))
-                   (p/mcat #(handle-response f cfg params %))))
-
-            (catch Throwable cause
-              (p/rejected cause)))
-
+        (if @enabled
+          (let [res (process-request! cfg params)]
+            (if (:enabled? res)
+              (if (:allowed? res)
+                (-> (f cfg params)
+                    (vary-meta update ::http/headers merge (:headers res)))
+                (ex/raise :type :rate-limit
+                          :code :request-blocked
+                          :hint "rate limit reached"
+                          ::http/headers (:headers res)))
+              (f cfg params)))
           (f cfg params))))
     f))
 

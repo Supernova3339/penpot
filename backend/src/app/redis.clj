@@ -345,7 +345,7 @@
                 (do
                   (l/error :hint "no script found" :name sname :cause cause)
                   (->> (load-script)
-                       (p/mapcat eval-script)))
+                       (p/mcat eval-script)))
                 (if-let [on-error (::rscript/on-error script)]
                   (on-error cause)
                   (p/rejected cause))))
@@ -376,15 +376,16 @@
             (load-script []
               (l/trace :hint "load script" :name sname)
               (->> (.scriptLoad ^RedisScriptingAsyncCommands cmd
-                               ^String (read-script))
-                   (p/map (fn [sha]
-                            (swap! scripts-cache assoc sname sha)
-                            sha))))]
+                                ^String (read-script))
+                   (p/fmap (fn [sha]
+                             (swap! scripts-cache assoc sname sha)
+                             sha))))]
 
-      (if-let [sha (get @scripts-cache sname)]
-        (eval-script sha)
-        (->> (load-script)
-             (p/mapcat eval-script))))))
+      (p/await!
+       (if-let [sha (get @scripts-cache sname)]
+         (eval-script sha)
+         (->> (load-script)
+              (p/mapcat eval-script)))))))
 
 (defn timeout-exception?
   [cause]

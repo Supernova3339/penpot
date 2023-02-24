@@ -207,7 +207,7 @@
     (cond/wrap cfg $ mdata)
     (retry/wrap-retry cfg $ mdata)
     (climit/wrap cfg $ mdata)
-    ;; (rlimit/wrap cfg $ mdata)
+    (rlimit/wrap cfg $ mdata)
     (wrap-audit cfg $ mdata)
     (wrap-spec-conform cfg $ mdata)
     (wrap-authentication cfg $ mdata)
