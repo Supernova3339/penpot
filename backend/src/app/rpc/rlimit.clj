@@ -119,22 +119,21 @@
 (defmethod parse-limit :bucket
   [[name strategy opts :as vlimit]]
   (us/assert! ::limit-tuple vlimit)
-  (merge
-   {::name name
-    ::strategy strategy}
-   (if-let [[_ capacity rate interval] (re-find bucket-opts-re opts)]
-     (let [interval (dt/duration interval)
-           rate     (parse-long rate)
-           capacity (parse-long capacity)]
-       {::capacity capacity
-        ::rate     rate
-        ::interval interval
-        ::opts     opts
-        ::params   [(dt/->seconds interval) rate capacity]
-        ::key      (str "ratelimit.bucket." (d/name name))})
-     (ex/raise :type :validation
-               :code :invalid-bucket-limit-opts
-               :hint (str/ffmt "looks like '%' does not have a valid format" opts)))))
+  (if-let [[_ capacity rate interval] (re-find bucket-opts-re opts)]
+    (let [interval (dt/duration interval)
+          rate     (parse-long rate)
+          capacity (parse-long capacity)]
+      {::name name
+       ::strategy strategy
+       ::capacity capacity
+       ::rate     rate
+       ::interval interval
+       ::opts     opts
+       ::params   [(dt/->seconds interval) rate capacity]
+       ::key      (str "ratelimit.bucket." (d/name name))})
+    (ex/raise :type :validation
+              :code :invalid-bucket-limit-opts
+              :hint (str/ffmt "looks like '%' does not have a valid format" opts))))
 
 (defmethod process-limit :bucket
   [redis user-id now {:keys [::key ::params ::service ::capacity ::interval ::rate] :as limit}]
@@ -151,10 +150,10 @@
              :limit (name (::name limit))
              :strategy (name (::strategy limit))
              :opts (::opts limit)
-             :allowed? allowed?
+             :allowed allowed?
              :remaining remaining)
     (-> limit
-        (assoc ::lresult/allowed? allowed?)
+        (assoc ::lresult/allowed allowed?)
         (assoc ::lresult/reset (dt/plus now reset))
         (assoc ::lresult/remaining remaining))))
 
@@ -173,25 +172,24 @@
              :limit (name (::name limit))
              :strategy (name (::strategy limit))
              :opts (::opts limit)
-             :allowed? allowed?
+             :allowed allowed?
              :remaining remaining)
     (-> limit
-        (assoc ::lresult/allowed? allowed?)
+        (assoc ::lresult/allowed allowed?)
         (assoc ::lresult/remaining remaining)
         (assoc ::lresult/reset (dt/plus ts {unit 1})))))
 
 (defn- process-limits!
   [redis user-id limits now]
-  (let [results   (map (partial process-limit redis user-id now) limits)
+  (let [results   (into [] (map (partial process-limit redis user-id now)) limits)
         remaining (->> results
                        (d/index-by ::name ::lresult/remaining)
                        (uri/map->query-string))
         reset     (->> results
                        (d/index-by ::name (comp dt/->seconds ::lresult/reset))
                        (uri/map->query-string))
-        rejected  (->> results
-                       (filter (complement ::lresult/allowed?))
-                       (first))]
+
+        rejected  (d/seek (complement ::lresult/allowed) results)]
 
     (when rejected
       (l/warn :hint "rejected rate limit"
@@ -200,17 +198,18 @@
               :limit-name (-> rejected ::name name)
               :limit-strategy (-> rejected ::strategy name)))
 
-    {:enabled? true
-     :allowed? (not (some? rejected))
-     :headers  {"x-rate-limit-remaining" remaining
-                "x-rate-limit-reset" reset}}))
+    {::enabled true
+     ::allowed (not (some? rejected))
+     ::remaingin remaining
+     ::reset reset
+     ::headers  {"x-rate-limit-remaining" remaining
+                 "x-rate-limit-reset" reset}}))
 
 (defn- get-limits
   [state skey sname]
-  (some->> (or (get-in @state [::limits skey])
-               (get-in @state [::limits :default]))
-           (map #(assoc % ::service sname))
-           (seq)))
+  (when-let [limits (or (get-in @state [::limits skey])
+                        (get-in @state [::limits :default]))]
+    (into [] (map #(assoc % ::service sname)) limits)))
 
 (defn- get-uid
   [{:keys [::http/request] :as params}]
@@ -220,20 +219,24 @@
 
 (defn process-request!
   [{:keys [::rpc/rlimit ::rds/redis ::skey ::sname] :as cfg} params]
-
   (when-let [limits (get-limits rlimit skey sname)]
     (let [redis  (rds/get-or-connect redis ::rpc/rlimit default-options)
           uid    (get-uid params)
           result (ex/try! (process-limits! redis uid limits (dt/now)))]
 
+      (l/info :hint "process-limits"
+              :service sname
+              :remaining (::remaingin result)
+              :reset (::reset result))
+
       (cond
         (ex/exception? result)
         (do
           (l/error :hint "error on processing rate-limit" :cause result)
-          {:enabled? false})
+          {::enabled false})
 
         (contains? cf/flags :soft-rpc-rlimit)
-        {:enabled? false}
+        {::enabled false}
 
         :else
         result))))
@@ -250,19 +253,19 @@
                     (assoc ::skey skey)
                     (assoc ::sname sname))]
 
-      (fn [cfg params]
+      (fn [hcfg params]
         (if @enabled
-          (let [res (process-request! cfg params)]
-            (if (:enabled? res)
-              (if (:allowed? res)
-                (-> (f cfg params)
-                    (vary-meta update ::http/headers merge (:headers res)))
+          (let [result (process-request! cfg params)]
+            (if (::enabled result)
+              (if (::allowed result)
+                (-> (f hcfg params)
+                    (vary-meta update ::http/headers merge (::headers result)))
                 (ex/raise :type :rate-limit
                           :code :request-blocked
                           :hint "rate limit reached"
-                          ::http/headers (:headers res)))
-              (f cfg params)))
-          (f cfg params))))
+                          ::http/headers (::headers result)))
+              (f hcfg params)))
+          (f hcfg params))))
     f))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
