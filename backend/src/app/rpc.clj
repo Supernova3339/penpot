@@ -64,16 +64,16 @@
   (if (fn? result)
     (result request)
     (let [mdata (meta result)]
-      (-> (yrs/response {:status  (::http/status mdata 200)
-                         :headers (::http/headers mdata {})
-                         :body    (rph/unwrap result)})
-          #_(handle-response-transformation request mdata)
-          #_(handle-before-comple-hook mdata)))))
+      (-> {::yrs/status  (::http/status mdata 200)
+           ::yrs/headers (::http/headers mdata {})
+           ::yrs/body    (rph/unwrap result)}
+          (handle-response-transformation request mdata)
+          (handle-before-comple-hook mdata)))))
 
 (defn- rpc-query-handler
   "Ring handler that dispatches query requests and convert between
   internal async flow into ring async flow."
-  [methods {:keys [params path-params] :as request} respond raise]
+  [methods {:keys [params path-params] :as request}]
   (let [type       (keyword (:type path-params))
         profile-id (or (::session/profile-id request)
                        (::actoken/profile-id request))
@@ -86,16 +86,14 @@
                          (assoc :profile-id profile-id)
                          (assoc ::profile-id profile-id))
                      (dissoc data :profile-id ::profile-id))
-        method     (get methods type default-handler)]
-
-    (->> (method data)
-         (p/mcat (partial handle-response request))
-         (p/fnly (pu/handler respond raise)))))
+        method     (get methods type default-handler)
+        response   (method data)]
+    (handle-response request response)))
 
 (defn- rpc-mutation-handler
   "Ring handler that dispatches mutation requests and convert between
   internal async flow into ring async flow."
-  [methods {:keys [params path-params] :as request} respond raise]
+  [methods {:keys [params path-params] :as request}]
   (let [type       (keyword (:type path-params))
         profile-id (or (::session/profile-id request)
                        (::actoken/profile-id request))
@@ -107,21 +105,18 @@
                          (assoc :profile-id profile-id)
                          (assoc ::profile-id profile-id))
                      (dissoc data :profile-id))
-        method     (get methods type default-handler)]
-
-    (->> (method data)
-         (p/fmap (partial handle-response request))
-         (p/fnly (pu/handler respond raise)))))
+        method     (get methods type default-handler)
+        response   (method data)]
+    (handle-response request response)))
 
 (defn- rpc-command-handler
   "Ring handler that dispatches cmd requests and convert between
   internal async flow into ring async flow."
-  [methods {:keys [params path-params] :as request} respond raise]
+  [methods {:keys [params path-params] :as request}]
   (let [type       (keyword (:type path-params))
         etag       (yrq/get-header request "if-none-match")
         profile-id (or (::session/profile-id request)
                        (::actoken/profile-id request))
-
         data       (-> params
                        (assoc ::request-at (dt/now))
                        (assoc ::session/id (::session/id request))
@@ -132,10 +127,11 @@
 
         method    (get methods type default-handler)]
 
+    (prn "rpc-command-handler" (Thread/currentThread))
+
     (binding [cond/*enabled* true]
-      (->> (method data)
-           (p/fmap (partial handle-response request))
-           (p/fnly (pu/handler respond raise))))))
+      (let [response (method data)]
+        (handle-response request response)))))
 
 (defn- wrap-metrics
   "Wrap service method with metrics measurement."
@@ -150,7 +146,6 @@
                       :id metrics-id
                       :val (inst-ms (tp))
                       :labels labels)))))))
-
 
 (defn- wrap-authentication
   [_ f mdata]
@@ -197,8 +192,7 @@
   [_ f mdata]
   (let [spec (or (::sv/spec mdata) (s/spec any?))]
     (fn [cfg params]
-      (let [params (us/conform spec params)]
-        (f cfg params)))))
+      (f cfg (us/conform spec params)))))
 
 (defn- wrap-all
   [cfg f mdata]
@@ -216,13 +210,8 @@
 (defn- wrap
   [cfg f mdata]
   (l/debug :hint "register method" :name (::sv/name mdata))
-  (let [f (wrap-all cfg f mdata)
-        x (px/resolve-executor :vthread)]
-    (with-meta
-      (fn [params]
-        (px/with-dispatch x
-          (f cfg params)))
-      mdata)))
+  (let [f (wrap-all cfg f mdata)]
+    (with-meta (partial f cfg) mdata)))
 
 (defn- process-method
   [cfg vfn]
@@ -325,12 +314,11 @@
                 ::db/pool
                 ::main/props
                 ::wrk/executor
-                ::session/manager
-                ::actoken/manager]))
+                ::session/manager]))
 
 (defmethod ig/init-key ::routes
   [_ {:keys [::methods] :as cfg}]
-  [["/rpc" {:middleware [[session/authz cfg]
+  [["/rpc" {:middleware [#_[session/authz cfg]
                          [actoken/authz cfg]]}
     ["/command/:type" {:handler (partial rpc-command-handler (:commands methods))}]
     ["/query/:type" {:handler (partial rpc-query-handler (:queries methods))}]

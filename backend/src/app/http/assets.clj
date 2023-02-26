@@ -18,7 +18,7 @@
    [clojure.spec.alpha :as s]
    [integrant.core :as ig]
    [promesa.core :as p]
-   [yetti.response :as yrs]))
+   [yetti.response :as-alias yrs]))
 
 (def ^:private cache-max-age
   (dt/duration {:hours 24}))
@@ -46,9 +46,8 @@
                                   "x-host"   (cond-> host port (str ":" port))
                                   "x-mtype"  (:content-type mdata)
                                   "cache-control" (str "max-age=" (inst-ms cache-max-age))}]
-                     (yrs/response
-                      :status  307
-                      :headers headers)))))))
+                     {::yrs/status  307
+                      ::yrs/headers headers}))))))
 
 (defn- serve-object-from-fs
   [{:keys [::path]} obj]
@@ -59,7 +58,8 @@
                  "content-type" (:content-type mdata)
                  "cache-control" (str "max-age=" (inst-ms cache-max-age))}]
     (p/resolved
-     (yrs/response :status 204 :headers headers))))
+     {::yrs/status 204
+      ::yrs/headers headers})))
 
 (defn- serve-object
   "Helper function that returns the appropriate response depending on
@@ -78,7 +78,7 @@
        (p/mcat executor (fn [obj]
                           (if (some? obj)
                             (serve-object cfg obj)
-                            (p/resolved (yrs/response 404)))))
+                            (p/resolved {::yrs/status 404}))))
        (p/fnly executor (fn [result cause]
                           (if cause (raise cause) (respond result))))))
 
@@ -92,7 +92,7 @@
          (p/mcat executor (fn [sobj]
                             (if sobj
                               (serve-object cfg sobj)
-                              (p/resolved (yrs/response 404))))))))
+                              (p/resolved {::yrs/status 404})))))))
 
 (defn file-objects-handler
   "Handler that serves storage objects by file media id."

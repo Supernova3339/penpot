@@ -159,28 +159,25 @@
                     :created-at (dt/now)}
             token  (gen-token props params)]
 
-        (->> (write! manager token params)
-             (p/fmap (fn [session]
-                       (l/trace :hint "create" :profile-id (str profile-id))
-                       (-> response
-                           (assign-auth-token-cookie session)
-                           (assign-authenticated-cookie session)))))))))
+        (let [session (write! manager token params)]
+          (l/trace :hint "create" :profile-id (str profile-id))
+          (-> response
+              (assign-auth-token-cookie session)
+              (assign-authenticated-cookie session)))))))
+
 (defn delete-fn
   [{:keys [::manager]}]
   (us/assert! ::manager manager)
-  (letfn [(delete [{:keys [profile-id] :as request}]
-            (let [cname   (cf/get :auth-token-cookie-name default-auth-token-cookie-name)
-                  cookie  (yrq/get-cookie request cname)]
-              (l/trace :hint "delete" :profile-id profile-id)
-              (some->> (:value cookie) (delete! manager))))]
-    (fn [request response]
-      (p/do
-        (delete request)
-        (-> response
-            (assoc :status 204)
-            (assoc :body nil)
-            (clear-auth-token-cookie)
-            (clear-authenticated-cookie))))))
+  (fn [request response]
+    (let [cname   (cf/get :auth-token-cookie-name default-auth-token-cookie-name)
+          cookie  (yrq/get-cookie request cname)]
+      (l/trace :hint "delete" :profile-id (:profile-id request))
+      (some->> (:value cookie) (delete! manager))
+      (-> response
+          (assoc :status 204)
+          (assoc :body nil)
+          (clear-auth-token-cookie)
+          (clear-authenticated-cookie)))))
 
 (defn- gen-token
   [props {:keys [profile-id created-at]}]
@@ -219,34 +216,46 @@
           (respond)))))
 
 (defn- wrap-soft-auth
-  [handler {:keys [::manager]}]
+  [handler {:keys [::manager ::wrk/executor ::main/props]}]
   (us/assert! ::manager manager)
-  (let [{:keys [::wrk/executor ::main/props]} (meta manager)]
+  (letfn [(handle-request [request]
+            (try
+              (let [token  (get-token request)
+                    claims (decode-token props token)]
+                (cond-> request
+                  (map? claims)
+                  (assoc ::id (:tid claims))))
+              (catch Throwable cause
+                (l/trace :hint "exception on decoding malformed token" :cause cause)
+                request)))]
+
     (fn [request respond raise]
-      (let [token (ex/try! (get-token request))]
-        (if (ex/exception? token)
-          (raise token)
-          (let [claims  (decode-token props token)
-                request (cond-> request
-                          (map? claims)
-                          (-> (assoc ::token-claims claims)
-                              (assoc ::token token)))]
-            (handler request respond raise)))))))
+      (let [request (handle-request request)]
+        (handler request respond raise)))))
+
+(defn- wrap-reneval
+  [respond manager session]
+  (fn [response]
+    (let [session (update! manager session)]
+      (-> response
+          (assign-auth-token-cookie session)
+          (assign-authenticated-cookie session)
+          (respond)))))
 
 (defn- wrap-authz
   [handler {:keys [::manager]}]
   (us/assert! ::manager manager)
-  (fn [request respond raise]
-    (if-let [token (::token request)]
-      (let [session (get-session manager token)
-            request (-> request
-                        (assoc ::profile-id (:profile-id session))
-                        (assoc ::id (:id session)))
-            respond (cond-> respond
-                      (renew-session? session)
-                      (wrap-reneval manager session))]
-        (handler request respond raise))
-      (handler request respond raise))))
+  (fn [request]
+    (let [session  (get-session manager (::token request))
+          request  (cond-> request
+                     (some? session)
+                     (assoc ::profile-id (:profile-id session)
+                            ::id (:id session)))]
+
+      (cond-> (handler request)
+        (renew-session? session)
+        (-> (assign-auth-token-cookie session)
+            (assign-authenticated-cookie session))))))
 
 (def soft-auth
   {:name ::soft-auth

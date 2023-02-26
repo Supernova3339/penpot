@@ -8,7 +8,6 @@
   (:require
    [app.auth.oidc :as-alias oidc]
    [app.common.data :as d]
-   [promesa.exec :as px]
    [app.common.logging :as l]
    [app.common.transit :as t]
    [app.db :as-alias db]
@@ -20,19 +19,21 @@
    [app.http.middleware :as mw]
    [app.http.session :as session]
    [app.http.websocket :as-alias ws]
+   [app.main :as-alias main]
    [app.metrics :as mtx]
    [app.rpc :as-alias rpc]
    [app.rpc.doc :as-alias rpc.doc]
    [app.worker :as wrk]
    [clojure.spec.alpha :as s]
    [integrant.core :as ig]
+   [promesa.exec :as px]
    [reitit.core :as r]
    [reitit.middleware :as rr]
    [yetti.adapter :as yt]
    [yetti.request :as yrq]
-   [yetti.response :as yrs]))
+   [yetti.response :as-alias yrs]))
 
-(declare wrap-router)
+(declare router-handler)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; HTTP SERVER
@@ -79,7 +80,7 @@
 
         handler (cond
                   (some? router)
-                  (wrap-router executor router)
+                  (router-handler executor router)
 
                   (some? handler)
                   handler
@@ -99,36 +100,34 @@
 
 (defn- not-found-handler
   [_ respond _]
-  (respond (yrs/response 404)))
+  (respond {::yrs/status 404}))
 
-(defn- wrap-router
+(defn- router-handler
   [^java.util.concurrent.Executor executor router]
-  (letfn [(handler [request respond raise]
+  (letfn [(resolve-handler [request]
             (if-let [match (r/match-by-path router (yrq/path request))]
               (let [params  (:path-params match)
                     result  (:result match)
                     handler (or (:handler result) not-found-handler)
                     request (assoc request :path-params params)]
-                (handler request respond raise))
-              (not-found-handler request respond raise)))
+                (partial handler request))
+              (partial not-found-handler request)))
 
-          (on-error [cause request respond]
+          (on-error [cause request]
             (let [{:keys [body] :as response} (errors/handle cause request)]
-              (respond
-               (cond-> response
-                 (map? body)
-                 (-> (update :headers assoc "content-type" "application/transit+json")
-                     (assoc :body (t/encode-str body {:type :json-verbose})))))))]
+              (cond-> response
+                (map? body)
+                (-> (update ::yrs/headers assoc "content-type" "application/transit+json")
+                    (assoc ::yrs/body (t/encode-str body {:type :json-verbose}))))))]
 
     (fn [request respond _]
-      (letfn [(respond' [response]
-                (yt/dispatch! request (partial respond response)))
-              (raise' [cause]
-                (yt/dispatch! request (partial on-error cause request respond')))]
-        (try
-          (handler request respond' raise')
-          (catch Throwable cause
-            (raise' cause)))))))
+      (let [handler (resolve-handler request)]
+        (handler
+         (fn [response]
+           (yt/dispatch! request (partial respond response)))
+         (fn [cause]
+           (let [response (on-error cause request)]
+             (yt/dispatch! request (partial respond response)))))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; HTTP ROUTER
@@ -136,12 +135,12 @@
 
 (defmethod ig/pre-init-spec ::router [_]
   (s/keys :req [::session/manager
-                ::actoken/manager
                 ::wrk/executor
                 ::ws/routes
                 ::rpc/routes
                 ::rpc.doc/routes
                 ::oidc/routes
+                ::main/props
                 ::assets/routes
                 ::debug/routes
                 ::db/pool
@@ -158,7 +157,8 @@
                       [session/soft-auth cfg]
                       [actoken/soft-auth cfg]
                       [mw/errors errors/handle]
-                      [mw/restrict-methods]]}
+                      [mw/restrict-methods]
+                      [mw/with-dispatch :vthread]]}
 
      (::mtx/routes cfg)
      (::assets/routes cfg)

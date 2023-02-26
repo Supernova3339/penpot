@@ -14,7 +14,6 @@
    [app.db :as-alias db]
    [app.email :as-alias email]
    [app.http :as-alias http]
-   [app.http.access-token :as-alias actoken]
    [app.http.assets :as-alias http.assets]
    [app.http.awsns :as http.awsns]
    [app.http.client :as-alias http.client]
@@ -218,11 +217,6 @@
     ::wrk/executor (ig/ref ::wrk/executor)
     ::props        (ig/ref :app.setup/props)}
 
-   ::actoken/manager
-   {::db/pool      (ig/ref ::db/pool)
-    ::wrk/executor (ig/ref ::wrk/executor)
-    ::props        (ig/ref :app.setup/props)}
-
    ::session.tasks/gc
    {::db/pool (ig/ref ::db/pool)}
 
@@ -280,7 +274,6 @@
 
    :app.http/router
    {::session/manager    (ig/ref ::session/manager)
-    ::actoken/manager    (ig/ref ::actoken/manager)
     ::wrk/executor       (ig/ref ::wrk/executor)
     ::db/pool            (ig/ref ::db/pool)
     ::rpc/routes         (ig/ref ::rpc/routes)
@@ -346,7 +339,6 @@
     ::db/pool         (ig/ref ::db/pool)
     ::wrk/executor    (ig/ref ::wrk/executor)
     ::session/manager (ig/ref ::session/manager)
-    ::actoken/manager (ig/ref ::actoken/manager)
     ::props           (ig/ref :app.setup/props)}
 
    ::wrk/registry

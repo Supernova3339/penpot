@@ -17,15 +17,8 @@
    [integrant.core :as ig]
    [promesa.core :as p]
    [promesa.exec :as px]
+   [yetti.adapter :as yt]
    [yetti.request :as yrq]))
-
-
-(s/def ::manager
-  (s/keys :req [::db/pool ::wrk/executor ::main/props]))
-
-(defmethod ig/pre-init-spec ::manager [_] ::manager)
-(defmethod ig/init-key ::manager [_ cfg] cfg)
-(defmethod ig/halt-key! ::manager [_ _])
 
 (def header-re #"^Token\s+(.*)")
 
@@ -48,40 +41,33 @@
               (db/decode-pgarray #{})))))
 
 (defn- wrap-soft-auth
-  [handler {:keys [::manager]}]
-  (us/assert! ::manager manager)
+  "Soft Authentication, will be executed synchronously on the undertow
+  worker thread."
+  [handler {:keys [::wrk/executor ::main/props]}]
+  (letfn [(handle-request [request]
+            (try
+              (let [token  (get-token request)
+                    claims (decode-token props token)]
+                (cond-> request
+                  (map? claims)
+                  (assoc ::id (:tid claims))))
+              (catch Throwable cause
+                (l/trace :hint "exception on decoding malformed token" :cause cause)
+                request)))]
 
-  (let [{:keys [::wrk/executor ::main/props]} manager]
     (fn [request respond raise]
-      (let [token (get-token request)]
-        (->> (px/submit! :vthread (partial decode-token props token))
-             (p/fnly (fn [claims cause]
-                       (when cause
-                         (l/trace :hint "exception on decoding malformed token" :cause cause))
-                       (let [request (cond-> request
-                                       (map? claims)
-                                       (assoc ::id (:tid claims)))]
-                         (handler request respond raise)))))))))
+      (let [request (handle-request request)]
+        (handler request respond raise)))))
 
 (defn- wrap-authz
-  [handler {:keys [::manager]}]
-  (us/assert! ::manager manager)
-  (let [{:keys [::wrk/executor ::db/pool]} manager]
-    (fn [request respond raise]
-      (if-let [token-id (::id request)]
-        (->> (px/submit! :vthread (partial get-token-perms pool token-id))
-             (p/fnly (fn [perms cause]
-                       (cond
-                         (some? cause)
-                         (raise cause)
-
-                         (nil? perms)
-                         (handler request respond raise)
-
-                         :else
-                         (let [request (assoc request ::perms perms)]
-                           (handler request respond raise))))))
-        (handler request respond raise)))))
+  "Authorization middleware, will be executed synchronously on vthread."
+  [handler {:keys [::wrk/executor ::db/pool]}]
+  (fn [request]
+    ;; (prn "access-token" "wrap-authz1" (Thread/currentThread))
+    (let [perms (some->> (::id request) (get-token-perms pool))]
+      (handler (cond-> request
+                 (some? perms)
+                 (assoc ::perms perms))))))
 
 (def soft-auth
   {:name ::soft-auth

@@ -910,7 +910,9 @@
                      (export! output-stream))))]
 
     (fn [_]
-      (yrs/response 200 body {"content-type" "application/octet-stream"}))))
+      {::yrs/status 200
+       ::yrs/body body
+       ::yrs/headers {"content-type" "application/octet-stream"}})))
 
 (s/def ::file ::media/upload)
 (s/def ::import-binfile

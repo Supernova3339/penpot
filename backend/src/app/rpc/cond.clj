@@ -51,7 +51,7 @@
                        (some-> (get-object cfg params) key-fn fmt-key))]
             (if (and (some? key)
                      (= key key'))
-              (fn [_] (yrs/response 304))
+              (fn [_] {::yrs/status 304})
               (let [result (f cfg params)
                     etag   (or (and reuse-key? key')
                                (some-> result meta ::key fmt-key)

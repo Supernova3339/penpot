@@ -55,6 +55,7 @@
    [app.redis :as rds]
    [app.redis.script :as-alias rscript]
    [app.rpc :as-alias rpc]
+   [app.rpc.helpers :as rph]
    [app.rpc.rlimit.result :as-alias lresult]
    [app.util.services :as-alias sv]
    [app.util.time :as dt]
@@ -259,6 +260,7 @@
             (if (::enabled result)
               (if (::allowed result)
                 (-> (f hcfg params)
+                    (rph/wrap)
                     (vary-meta update ::http/headers merge (::headers result)))
                 (ex/raise :type :rate-limit
                           :code :request-blocked

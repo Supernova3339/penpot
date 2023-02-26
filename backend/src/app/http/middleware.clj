@@ -63,6 +63,11 @@
 
           (handle-error [raise cause]
             (cond
+              (instance? RuntimeException cause)
+              (if-let [cause (ex-cause cause)]
+                (handle-error raise cause)
+                (raise cause))
+
               (instance? RequestTooBigException cause)
               (raise (ex/error :type :validation
                                :code :request-body-too-large
@@ -81,9 +86,7 @@
     (fn [request respond raise]
       (let [request (ex/try! (process-request request))]
         (if (ex/exception? request)
-          (if (ex/runtime-exception? request)
-            (handle-error raise (or (ex-cause request) request))
-            (handle-error raise request))
+          (handle-error raise request)
           (handler request respond raise))))))
 
 (def parse-request
@@ -130,15 +133,15 @@
                     (.close ^OutputStream output-stream))))))
 
           (format-response-with-json [response _]
-            (let [body (yrs/body response)]
+            (let [body (::yrs/body response)]
               (if (or (boolean? body) (coll? body))
                 (-> response
-                    (update :headers assoc "content-type" "application/json")
-                    (assoc :body (json-streamable-body body)))
+                    (update ::yrs/headers assoc "content-type" "application/json")
+                    (assoc ::yrs/body (json-streamable-body body)))
                 response)))
 
           (format-response-with-transit [response request]
-            (let [body (yrs/body response)]
+            (let [body (::yrs/body response)]
               (if (or (boolean? body) (coll? body))
                 (let [qs   (yrq/query request)
                       opts (if (or (contains? cf/flags :transit-readable-response)
@@ -146,8 +149,8 @@
                              {:type :json-verbose}
                              {:type :json})]
                   (-> response
-                      (update :headers assoc "content-type" "application/transit+json")
-                      (assoc :body (transit-streamable-body body opts))))
+                      (update ::yrs/headers assoc "content-type" "application/transit+json")
+                      (assoc ::yrs/body (transit-streamable-body body opts))))
                 response)))
 
           (format-response [response request]
@@ -171,8 +174,7 @@
     (fn [request respond raise]
       (handler request
                (fn [response]
-                 (let [response (process-response response request)]
-                   (respond response)))
+                 (respond (process-response response request)))
                raise))))
 
 (def format-response
@@ -181,9 +183,12 @@
 
 (defn wrap-errors
   [handler on-error]
-  (fn [request respond _]
+  (fn [request respond raise]
     (handler request respond (fn [cause]
-                               (-> cause (on-error request) respond)))))
+                               (try
+                                 (respond (on-error cause request))
+                                 (catch Throwable cause
+                                   (raise cause)))))))
 
 (def errors
   {:name ::errors
@@ -203,11 +208,11 @@
                     (assoc "access-control-allow-headers" "x-frontend-version, content-type, accept, x-requested-width"))))
 
             (update-response [response request]
-              (update response :headers add-headers request))]
+              (update response ::yrs/headers add-headers request))]
 
       (fn [request respond raise]
         (if (= (yrq/method request) :options)
-          (-> (yrs/response 200)
+          (-> {::yrs/status 200}
               (update-response request)
               (respond))
           (handler request
@@ -227,7 +232,7 @@
         (let [method (yrq/method request)]
           (if (contains? allowed method)
             (handler request respond raise)
-            (respond (yrs/response 405))))))))
+            (respond {::yrs/status 405})))))))
 
 (def restrict-methods
   {:name ::restrict-methods
@@ -238,10 +243,10 @@
    :compile
    (fn [& _]
      (fn [handler executor]
-       (fn [request respond raise]
-         (->> (px/submit! executor #(handler request))
-              (p/mcat p/wrap)
-              (p/fnly (pu/handler respond raise))))))})
+       (let [executor (px/resolve-executor executor)]
+         (fn [request respond raise]
+           (->> (px/submit! executor (partial handler request))
+                (p/fnly (pu/handler respond raise)))))))})
 
 (def with-config
   {:name ::with-config
